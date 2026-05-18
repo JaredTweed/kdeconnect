@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     process::{Command, Stdio},
     sync::Mutex,
 };
@@ -17,6 +17,9 @@ use crate::{
 
 static NOTIFICATION_IDS: Lazy<Mutex<HashMap<String, u32>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+static PROGRAMMATIC_CLOSES: Lazy<Mutex<HashSet<String>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Notification {
@@ -96,6 +99,13 @@ impl Notification {
             None
         };
 
+        if old_handle_id.is_some()
+            && !key.is_empty()
+            && let Ok(mut closed) = PROGRAMMATIC_CLOSES.lock()
+        {
+            closed.insert(key.clone());
+        }
+
         tokio::task::spawn_blocking(move || {
             if let Some(old_id) = old_handle_id {
                 close_notification_sync(old_id);
@@ -141,7 +151,14 @@ impl Notification {
 
                 match action {
                     "__closed" => {
-                        if !key.is_empty() {
+                        let was_programmatic = !key.is_empty()
+                            && PROGRAMMATIC_CLOSES
+                                .lock()
+                                .ok()
+                                .map(|mut c| c.remove(&key))
+                                .unwrap_or(false);
+
+                        if !was_programmatic && !key.is_empty() {
                             let packet = ProtocolPacket::new(
                                 PacketType::NotificationRequest,
                                 serde_json::json!({ "cancel": key }),
@@ -404,6 +421,44 @@ mod tests {
         assert!(
             result.is_ok(),
             "cancel notification must return immediately"
+        );
+    }
+
+    #[test]
+    fn duplicate_notification_does_not_send_cancel_to_phone() {
+        let key = "dedup-no-cancel-test";
+        NOTIFICATION_IDS
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), 99998);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let notification = test_notification(key, "Dedup Title");
+            let device = Device {
+                device_id: DeviceId("test-device-dedup-nocancel".to_string()),
+                ..Default::default()
+            };
+            let (core_tx, _core_rx) = tokio::sync::mpsc::unbounded_channel();
+            notification.received_packet(&device, core_tx).await;
+        });
+
+        let was_programmatic = PROGRAMMATIC_CLOSES
+            .lock()
+            .unwrap()
+            .remove(key);
+
+        NOTIFICATION_IDS.lock().unwrap().remove(key);
+        rt.shutdown_background();
+
+        assert!(
+            was_programmatic,
+            "duplicate notification key must be recorded in PROGRAMMATIC_CLOSES \
+             so the old notification's __closed callback does not send cancel to the phone"
         );
     }
 
