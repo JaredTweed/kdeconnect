@@ -18,8 +18,7 @@ use crate::{
 static NOTIFICATION_IDS: Lazy<Mutex<HashMap<String, u32>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-static PROGRAMMATIC_CLOSES: Lazy<Mutex<HashSet<String>>> =
-    Lazy::new(|| Mutex::new(HashSet::new()));
+static PROGRAMMATIC_CLOSES: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Notification {
@@ -447,10 +446,7 @@ mod tests {
             notification.received_packet(&device, core_tx).await;
         });
 
-        let was_programmatic = PROGRAMMATIC_CLOSES
-            .lock()
-            .unwrap()
-            .remove(key);
+        let was_programmatic = PROGRAMMATIC_CLOSES.lock().unwrap().remove(key);
 
         NOTIFICATION_IDS.lock().unwrap().remove(key);
         rt.shutdown_background();
