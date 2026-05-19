@@ -5,6 +5,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
 };
 use tracing::debug;
+use x509_parser::prelude::*;
 
 use crate::{
     crypto::KeyStore,
@@ -19,42 +20,60 @@ pub const DEVICE_ID_STORE: &str = "device_id";
 /// The phone checks this list before sending unsolicited data (battery, SMS messages, etc.).
 const INCOMING_CAPABILITIES: &[&str] = &[
     "kdeconnect.battery",
+    "kdeconnect.battery.request",
     "kdeconnect.clipboard",
     "kdeconnect.clipboard.connect",
     "kdeconnect.connectivity_report",
+    "kdeconnect.digitizer",
+    "kdeconnect.digitizer.session",
     "kdeconnect.contacts.response_uids_timestamps",
     "kdeconnect.contacts.response_vcards",
+    "kdeconnect.findmyphone.request",
+    "kdeconnect.mousepad.echo",
     "kdeconnect.mousepad.keyboardstate",
+    "kdeconnect.mousepad.request",
     "kdeconnect.mpris",
-    "kdeconnect.mpris.request",
     "kdeconnect.notification",
+    "kdeconnect.notification.request",
     "kdeconnect.ping",
+    "kdeconnect.presenter",
+    "kdeconnect.runcommand",
     "kdeconnect.runcommand.request",
     "kdeconnect.share.request",
+    "kdeconnect.sftp",
     "kdeconnect.sms.messages",
-    "kdeconnect.sms.attachment_file",
+    "kdeconnect.systemvolume.request",
     "kdeconnect.telephony",
 ];
 
 const OUTGOING_CAPABILITIES: &[&str] = &[
+    "kdeconnect.battery",
     "kdeconnect.battery.request",
     "kdeconnect.clipboard",
+    "kdeconnect.clipboard.connect",
     "kdeconnect.contacts.request_all_uids_timestamps",
     "kdeconnect.contacts.request_vcards_by_uid",
+    "kdeconnect.connectivity_report.request",
     "kdeconnect.findmyphone.request",
+    "kdeconnect.mousepad.echo",
     "kdeconnect.mousepad.keyboardstate",
     "kdeconnect.mousepad.request",
     "kdeconnect.mpris",
     "kdeconnect.mpris.request",
     "kdeconnect.notification.request",
+    "kdeconnect.notification",
+    "kdeconnect.notification.action",
+    "kdeconnect.notification.reply",
     "kdeconnect.ping",
     "kdeconnect.runcommand",
+    "kdeconnect.runcommand.request",
     "kdeconnect.share.request",
-    "kdeconnect.share.request.update",
+    "kdeconnect.sftp.request",
     "kdeconnect.sms.request",
     "kdeconnect.sms.request_conversations",
     "kdeconnect.sms.request_conversation",
-    "kdeconnect.sms.request_attachment",
+    "kdeconnect.systemvolume",
+    "kdeconnect.telephony.request_mute",
 ];
 
 #[derive(Debug)]
@@ -69,42 +88,40 @@ pub struct Config {
 impl Config {
     pub async fn load(_out_caps: Vec<String>) -> anyhow::Result<Self> {
         let config_dir = dirs::config_dir()
-            .expect("cannot find config dir")
+            .ok_or_else(|| anyhow::anyhow!("cannot find config dir"))?
             .join(CONFIG_DIR);
 
         if !config_dir.exists() {
-            fs::create_dir_all(&config_dir)
-                .await
-                .expect("cannot create config dir");
+            fs::create_dir_all(&config_dir).await?;
         }
 
         let id_file = config_dir.join(DEVICE_ID_STORE);
-
-        let identity = match id_file.exists() {
-            true => {
-                let mut buffer = String::new();
-                let mut file = fs::File::open(&id_file).await.expect("cannot open file");
-
-                file.read_to_string(&mut buffer)
-                    .await
-                    .expect("fail reading file content");
-
-                let device_id = buffer.trim().to_string();
-                make_identity(device_id, Some(DEFAULT_LISTEN_PORT)).await
-            }
-            false => {
-                let device_id = uuid::Uuid::new_v4().to_string();
-
-                let mut file = fs::File::create(&id_file)
-                    .await
-                    .expect("cannot create file");
-                file.write_all(device_id.as_bytes())
-                    .await
-                    .expect("fail writing device id to file");
-
-                make_identity(device_id, Some(DEFAULT_LISTEN_PORT)).await
-            }
+        let stored_device_id = if id_file.exists() {
+            let mut buffer = String::new();
+            let mut file = fs::File::open(&id_file).await?;
+            file.read_to_string(&mut buffer).await?;
+            Some(buffer.trim().to_string())
+        } else {
+            None
         };
+
+        let cert_device_id = certificate_common_name(&config_dir.join("certificate.pem")).await;
+        let device_id = cert_device_id
+            .or(stored_device_id)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        if fs::read_to_string(&id_file)
+            .await
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            != Some(device_id.as_str())
+        {
+            let mut file = fs::File::create(&id_file).await?;
+            file.write_all(device_id.as_bytes()).await?;
+        }
+
+        let identity = make_identity(device_id, Some(DEFAULT_LISTEN_PORT)).await;
 
         debug!("CONFIG initialized.");
 
@@ -115,12 +132,22 @@ impl Config {
                 .to_string(),
             listen_addr: DEFAULT_LISTEN_ADDR,
             discovery_interval: DEFAULT_DISCOVERY_INTERVAL,
-            key_store: KeyStore::load(&identity.device_id)
-                .await
-                .expect("failed to create keystore"),
+            key_store: KeyStore::load(&identity.device_id).await?,
             identity,
         })
     }
+}
+
+async fn certificate_common_name(path: &std::path::Path) -> Option<String> {
+    let bytes = fs::read(path).await.ok()?;
+    let (_, pem) = parse_x509_pem(&bytes).ok()?;
+    let cert = pem.parse_x509().ok()?;
+    cert.subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(str::to_string)
+        .filter(|id| !id.is_empty())
 }
 
 async fn make_identity(device_id: String, tcp_port: Option<u16>) -> Identity {
@@ -141,6 +168,8 @@ async fn make_identity(device_id: String, tcp_port: Option<u16>) -> Identity {
             .collect(),
         protocol_version: PROTOCOL_VERSION,
         tcp_port,
+        target_device_id: None,
+        target_protocol_version: None,
     }
 }
 
@@ -162,5 +191,28 @@ async fn identify_device_type() -> DeviceType {
         }
     } else {
         DeviceType::Desktop
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INCOMING_CAPABILITIES, OUTGOING_CAPABILITIES};
+
+    #[test]
+    fn advertised_capabilities_cover_gsconnect_compatible_actions() {
+        assert!(OUTGOING_CAPABILITIES.contains(&"kdeconnect.clipboard.connect"));
+        assert!(OUTGOING_CAPABILITIES.contains(&"kdeconnect.notification.action"));
+        assert!(OUTGOING_CAPABILITIES.contains(&"kdeconnect.notification.reply"));
+
+        assert!(INCOMING_CAPABILITIES.contains(&"kdeconnect.clipboard.connect"));
+        assert!(INCOMING_CAPABILITIES.contains(&"kdeconnect.notification"));
+        assert!(INCOMING_CAPABILITIES.contains(&"kdeconnect.notification.request"));
+    }
+
+    #[test]
+    fn advertised_capabilities_do_not_claim_unimplemented_lock_plugin() {
+        assert!(!INCOMING_CAPABILITIES.contains(&"kdeconnect.lock"));
+        assert!(!OUTGOING_CAPABILITIES.contains(&"kdeconnect.lock"));
+        assert!(!OUTGOING_CAPABILITIES.contains(&"kdeconnect.lock.request"));
     }
 }
