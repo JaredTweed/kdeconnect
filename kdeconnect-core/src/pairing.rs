@@ -63,7 +63,7 @@ impl PairingManager {
             .map(|d| d.remote_certificate.clone())
             .unwrap_or_default();
 
-        let mut device = Device::new(
+        let mut device = Device::from_discovery(
             id.0.clone(),
             name.clone(),
             existing

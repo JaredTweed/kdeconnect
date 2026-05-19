@@ -92,7 +92,12 @@ impl Default for Device {
 }
 
 impl Device {
-    pub async fn new(
+    /// Legacy constructor for upstream-compatible callers.
+    pub async fn new(id: String, name: String, addr: SocketAddr) -> anyhow::Result<Self> {
+        Self::from_discovery(id, name, "phone".to_string(), vec![], vec![], addr).await
+    }
+
+    pub async fn from_discovery(
         id: String,
         name: String,
         device_type: String,

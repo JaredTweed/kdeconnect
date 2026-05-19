@@ -191,7 +191,7 @@ impl KdeConnectCore {
                 let shutdown_tx = meta.shutdown_tx;
                 debug!("[core] new connection from: {}", addr);
 
-                let mut device = match Device::new(
+                let mut device = match Device::from_discovery(
                     id.0.clone(),
                     name,
                     device_type,

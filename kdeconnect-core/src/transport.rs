@@ -875,7 +875,7 @@ async fn paired_certificate_mismatch(
         return false;
     }
 
-    let Ok(device) = Device::new(
+    let Ok(device) = Device::from_discovery(
         id.0.clone(),
         name.to_string(),
         device_type,

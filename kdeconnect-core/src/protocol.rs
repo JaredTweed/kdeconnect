@@ -455,6 +455,11 @@ pub struct Pair {
 }
 
 impl Pair {
+    /// Backward-compatible constructor used by upstream callers.
+    pub fn new(pair: bool) -> Self {
+        Pair { pair, timestamp: None }
+    }
+
     pub fn request() -> Self {
         let timestamp = Some(
             SystemTime::now()
