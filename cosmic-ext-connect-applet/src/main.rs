@@ -7,20 +7,21 @@ use messages::Message;
 use models::Device;
 
 use cosmic::app::Core;
+use cosmic::iced::platform_specific::shell::commands::popup::{destroy_popup, get_popup};
 use cosmic::iced::window::Id as SurfaceId;
 use cosmic::iced::{Limits, Subscription};
-use cosmic::iced::platform_specific::shell::commands::popup::{destroy_popup, get_popup};
 use cosmic::{Element, Task, widget};
-use std::collections::HashMap;
-use tracing::{debug, error, info};
+use std::collections::{HashMap, HashSet};
+use tracing::{debug, error, info, warn};
 
 pub struct KdeConnectApplet {
     core: Core,
     popup: Option<SurfaceId>,
     devices: HashMap<String, Device>,
     expanded_device: Option<String>,
-    /// Pending pairing requests: device_id → device_name
     pairing_requests: HashMap<String, String>,
+    pairing_in_progress: HashSet<String>,
+    pairing_attempts: HashMap<String, u64>,
 }
 
 impl cosmic::Application for KdeConnectApplet {
@@ -49,6 +50,8 @@ impl cosmic::Application for KdeConnectApplet {
             devices: HashMap::new(),
             expanded_device: None,
             pairing_requests: HashMap::new(),
+            pairing_in_progress: HashSet::new(),
+            pairing_attempts: HashMap::new(),
         };
 
         (app, Task::none())
@@ -68,7 +71,7 @@ impl cosmic::Application for KdeConnectApplet {
                     self.popup.replace(new_id);
 
                     let mut popup_settings = self.core.applet.get_popup_settings(
-                        self.core.main_window_id().unwrap(),
+                        self.core.main_window_id().unwrap_or_else(SurfaceId::unique),
                         new_id,
                         None,
                         None,
@@ -103,6 +106,15 @@ impl cosmic::Application for KdeConnectApplet {
                 for device in devices {
                     self.devices.insert(device.id.clone(), device);
                 }
+                self.pairing_requests
+                    .retain(|id, _| self.devices.contains_key(id));
+                self.pairing_in_progress
+                    .retain(|id| match self.devices.get(id) {
+                        Some(d) => !d.is_paired && d.is_reachable,
+                        None => false,
+                    });
+                self.pairing_attempts
+                    .retain(|id, _| self.pairing_in_progress.contains(id));
             }
             Message::DelayedRefresh => {
                 return Task::perform(backend::fetch_devices(), |devices| {
@@ -116,7 +128,11 @@ impl cosmic::Application for KdeConnectApplet {
                     self.expanded_device = Some(device_id.clone());
                     let id = device_id.clone();
                     return Task::perform(
-                        async move { backend::request_run_commands(id).await.ok(); },
+                        async move {
+                            if let Err(e) = backend::request_run_commands(id).await {
+                                error!("Failed to request run commands: {:?}", e);
+                            }
+                        },
                         |_| cosmic::Action::App(Message::RefreshDevices),
                     );
                 }
@@ -151,7 +167,9 @@ impl cosmic::Application for KdeConnectApplet {
                 let id = device_id.clone();
                 return Task::perform(
                     async move {
-                        backend::ping_device(id).await.ok();
+                        if let Err(e) = backend::ping_device(id).await {
+                            error!("Failed to ping device: {:?}", e);
+                        }
                     },
                     |_| cosmic::Action::App(Message::RefreshDevices),
                 );
@@ -160,7 +178,9 @@ impl cosmic::Application for KdeConnectApplet {
                 let id = device_id.clone();
                 return Task::perform(
                     async move {
-                        backend::ring_device(id).await.ok();
+                        if let Err(e) = backend::ring_device(id).await {
+                            error!("Failed to ring device: {:?}", e);
+                        }
                     },
                     |_| cosmic::Action::App(Message::RefreshDevices),
                 );
@@ -169,25 +189,53 @@ impl cosmic::Application for KdeConnectApplet {
                 let id = device_id.clone();
                 return Task::perform(
                     async move {
-                        backend::browse_device_filesystem(id).await.ok();
+                        if let Err(e) = backend::browse_device_filesystem(id).await {
+                            error!("Failed to browse device: {:?}", e);
+                        }
                     },
                     |_| cosmic::Action::App(Message::RefreshDevices),
                 );
             }
             Message::PairDevice(ref device_id) => {
-                let id = device_id.clone();
-                return Task::perform(
-                    async move {
-                        backend::pair_device(id).await.ok();
-                    },
-                    |_| cosmic::Action::App(Message::RefreshDevices),
-                );
+                let attempt_id = self
+                    .pairing_attempts
+                    .get(device_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .wrapping_add(1);
+                self.pairing_attempts.insert(device_id.clone(), attempt_id);
+                self.pairing_in_progress.insert(device_id.clone());
+                let request_id = device_id.clone();
+                let timeout_id = device_id.clone();
+                return Task::batch(vec![
+                    Task::perform(
+                        async move {
+                            let result = backend::pair_device(request_id.clone()).await;
+                            if let Err(e) = &result {
+                                error!("Failed to pair device: {:?}", e);
+                            }
+                            (request_id, attempt_id, result.is_ok())
+                        },
+                        |(id, attempt, ok)| {
+                            cosmic::Action::App(Message::PairRequestFinished(id, attempt, ok))
+                        },
+                    ),
+                    Task::perform(
+                        async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+                            (timeout_id, attempt_id)
+                        },
+                        |(id, attempt)| cosmic::Action::App(Message::PairingTimedOut(id, attempt)),
+                    ),
+                ]);
             }
             Message::UnpairDevice(ref device_id) => {
                 let id = device_id.clone();
                 return Task::perform(
                     async move {
-                        backend::unpair_device(id).await.ok();
+                        if let Err(e) = backend::unpair_device(id).await {
+                            error!("Failed to unpair device: {:?}", e);
+                        }
                     },
                     |_| cosmic::Action::App(Message::RefreshDevices),
                 );
@@ -197,18 +245,21 @@ impl cosmic::Application for KdeConnectApplet {
                 return Task::perform(
                     async move {
                         let files = portal::pick_files(&fl!("file-picker-title"), true, None).await;
-                        if !files.is_empty() {
-                            backend::send_files(id, files).await.ok();
+                        if !files.is_empty()
+                            && let Err(e) = backend::send_files(id, files).await
+                        {
+                            error!("Failed to send files: {:?}", e);
                         }
                     },
                     |_| cosmic::Action::App(Message::RefreshDevices),
                 );
             }
             Message::UpdateTransferProgress(progress) => {
-                if let Some(ref current_device) = self.expanded_device {
-                    if let Some(device) = self.devices.get_mut(current_device) {
-                        device.share_progress = if progress < 100 { Some(progress) } else { None };
-                    }
+                if let Some(ref current_device) = self.expanded_device
+                    && let Some(device) = self.devices.get_mut(current_device)
+                    && device.has_share
+                {
+                    device.share_progress = if progress < 100 { Some(progress) } else { None };
                 }
             }
             Message::ShareClipboard(ref device_id) => {
@@ -223,7 +274,11 @@ impl cosmic::Application for KdeConnectApplet {
             Message::ClipboardReadForDevice(device_id, content) => {
                 if !content.is_empty() {
                     return Task::perform(
-                        async move { backend::send_clipboard(device_id, content).await.ok(); },
+                        async move {
+                            if let Err(e) = backend::send_clipboard(device_id, content).await {
+                                error!("Failed to send clipboard: {:?}", e);
+                            }
+                        },
                         |_| cosmic::Action::App(Message::RefreshDevices),
                     );
                 }
@@ -237,14 +292,18 @@ impl cosmic::Application for KdeConnectApplet {
                     device.is_charging = Some(charging);
                     // Also patch the backend cache so the next fetch_devices() preserves it
                     let d = device.clone();
-                    tokio::spawn(async move { backend::update_device(device_id, d).await; });
+                    tokio::spawn(async move {
+                        backend::update_device(device_id, d).await;
+                    });
                 }
             }
             Message::ConnectivityUpdated(device_id, strength) => {
                 if let Some(device) = self.devices.get_mut(&device_id) {
                     device.signal_strength = Some(strength);
                     let d = device.clone();
-                    tokio::spawn(async move { backend::update_device(device_id, d).await; });
+                    tokio::spawn(async move {
+                        backend::update_device(device_id, d).await;
+                    });
                 }
             }
             Message::AcceptPairing(ref device_id) => {
@@ -252,7 +311,9 @@ impl cosmic::Application for KdeConnectApplet {
                 let id = device_id.clone();
                 return Task::perform(
                     async move {
-                        backend::accept_pairing(id).await.ok();
+                        if let Err(e) = backend::accept_pairing(id).await {
+                            error!("Failed to accept pairing: {:?}", e);
+                        }
                     },
                     |_| cosmic::Action::App(Message::RefreshDevices),
                 );
@@ -262,13 +323,18 @@ impl cosmic::Application for KdeConnectApplet {
                 let id = device_id.clone();
                 return Task::perform(
                     async move {
-                        backend::reject_pairing(id).await.ok();
+                        if let Err(e) = backend::reject_pairing(id).await {
+                            error!("Failed to reject pairing: {:?}", e);
+                        }
                     },
                     |_| cosmic::Action::App(Message::RefreshDevices),
                 );
             }
             Message::PairingRequestReceived(device_id, device_name, _device_type) => {
-                info!("Pairing request received from {} ({})", device_name, device_id);
+                info!(
+                    "Pairing request received from {} ({})",
+                    device_name, device_id
+                );
                 self.pairing_requests.insert(device_id, device_name.clone());
 
                 // Show a system notification so the user is alerted even if they
@@ -292,7 +358,7 @@ impl cosmic::Application for KdeConnectApplet {
                     let new_id = SurfaceId::unique();
                     self.popup.replace(new_id);
                     let mut popup_settings = self.core.applet.get_popup_settings(
-                        self.core.main_window_id().unwrap(),
+                        self.core.main_window_id().unwrap_or_else(SurfaceId::unique),
                         new_id,
                         None,
                         None,
@@ -304,6 +370,39 @@ impl cosmic::Application for KdeConnectApplet {
                         .min_height(200.0)
                         .max_height(600.0);
                     return get_popup(popup_settings);
+                }
+            }
+            Message::PairRequestFinished(device_id, attempt_id, ok) => {
+                if self.pairing_attempts.get(&device_id).copied() != Some(attempt_id) {
+                    return Task::none();
+                }
+                if !ok {
+                    warn!("Pair request D-Bus call failed for {}", device_id);
+                    self.pairing_in_progress.remove(&device_id);
+                    self.pairing_attempts.remove(&device_id);
+                    return Task::perform(backend::fetch_devices(), |devices| {
+                        cosmic::Action::App(Message::DevicesUpdated(devices))
+                    });
+                }
+            }
+            Message::PairingFinished(device_id) => {
+                self.pairing_requests.remove(&device_id);
+                self.pairing_in_progress.remove(&device_id);
+                self.pairing_attempts.remove(&device_id);
+                return Task::perform(backend::fetch_devices(), |devices| {
+                    cosmic::Action::App(Message::DevicesUpdated(devices))
+                });
+            }
+            Message::PairingTimedOut(device_id, attempt_id) => {
+                if self.pairing_attempts.get(&device_id).copied() != Some(attempt_id) {
+                    return Task::none();
+                }
+                if self.pairing_in_progress.remove(&device_id) {
+                    self.pairing_attempts.remove(&device_id);
+                    warn!("Pair request timed out in applet for {}", device_id);
+                    return Task::perform(backend::fetch_devices(), |devices| {
+                        cosmic::Action::App(Message::DevicesUpdated(devices))
+                    });
                 }
             }
             Message::MprisReceived(device_id, mpris_data) => {
@@ -335,7 +434,11 @@ impl cosmic::Application for KdeConnectApplet {
             Message::RequestRunCommands(ref device_id) => {
                 let id = device_id.clone();
                 return Task::perform(
-                    async move { backend::request_run_commands(id).await.ok(); },
+                    async move {
+                        if let Err(e) = backend::request_run_commands(id).await {
+                            error!("Failed to request run commands: {:?}", e);
+                        }
+                    },
                     |_| cosmic::Action::App(Message::RefreshDevices),
                 );
             }
@@ -354,14 +457,20 @@ impl cosmic::Application for KdeConnectApplet {
                     device.run_commands = commands;
                     let d = device.clone();
                     let did = device_id.clone();
-                    tokio::spawn(async move { backend::update_device(did, d).await; });
+                    tokio::spawn(async move {
+                        backend::update_device(did, d).await;
+                    });
                 }
             }
             Message::ExecuteRunCommand(ref device_id, ref key) => {
                 let id = device_id.clone();
                 let k = key.clone();
                 return Task::perform(
-                    async move { backend::execute_run_command(id, k).await.ok(); },
+                    async move {
+                        if let Err(e) = backend::execute_run_command(id, k).await {
+                            error!("Failed to execute run command: {:?}", e);
+                        }
+                    },
                     |_| cosmic::Action::App(Message::RefreshDevices),
                 );
             }
@@ -389,6 +498,7 @@ impl cosmic::Application for KdeConnectApplet {
             &self.devices,
             self.expanded_device.as_ref(),
             Some(&self.pairing_requests),
+            &self.pairing_in_progress,
         )
     }
 
@@ -412,6 +522,9 @@ impl cosmic::Application for KdeConnectApplet {
                         match event {
                             kdeconnect_dbus_client::ServiceEvent::PairingRequested(id, name) => {
                                 yield Message::PairingRequestReceived(id, name, "phone".to_string());
+                            }
+                            kdeconnect_dbus_client::ServiceEvent::PairingFinished(id) => {
+                                yield Message::PairingFinished(id);
                             }
                             kdeconnect_dbus_client::ServiceEvent::ClipboardReceived(content) => {
                                 yield Message::ClipboardReceived(content);
