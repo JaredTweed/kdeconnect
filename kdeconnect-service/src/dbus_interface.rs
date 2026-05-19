@@ -3,7 +3,8 @@
 use anyhow::Result;
 use kdeconnect_core::{
     KdeConnectCore, PacketType, ProtocolPacket,
-    device::{DeviceId, DeviceState, PairState},
+    config::CONFIG_DIR,
+    device::{Device as CoreDevice, DeviceId, DeviceState, PairState},
     event::{AppEvent, ConnectionEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,8 @@ pub struct DbusDevice {
     pub id: String,
     pub name: String,
     pub device_type: String,
+    pub incoming_capabilities: Vec<String>,
+    pub outgoing_capabilities: Vec<String>,
     pub is_paired: bool,
     pub is_reachable: bool,
 }
@@ -41,7 +44,9 @@ pub struct DbusDevice {
 // --- Per-device cache helpers ------------------------------------------------
 
 fn device_cache_dir(device_id: &str) -> std::path::PathBuf {
-    let base = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("~/.local/share"));
+    let base = dirs::data_local_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
     base.join("kdeconnect").join(device_id)
 }
 
@@ -115,7 +120,96 @@ async fn load_sms_cache(device_id: &str) -> Option<String> {
     }
 }
 
+fn dbus_device_from_core(device: &CoreDevice, is_reachable: bool) -> DbusDevice {
+    DbusDevice {
+        id: device.device_id.0.clone(),
+        name: device.name.clone(),
+        device_type: device.device_type.clone(),
+        incoming_capabilities: device.incoming_capabilities.clone(),
+        outgoing_capabilities: device.outgoing_capabilities.clone(),
+        is_paired: true,
+        is_reachable,
+    }
+}
+
+async fn load_persisted_paired_device(device_id: &str) -> Option<CoreDevice> {
+    let path = dirs::config_dir()?
+        .join(CONFIG_DIR)
+        .join(format!("{device_id}.ron"));
+    let raw = tokio::fs::read_to_string(path).await.ok()?;
+    let device = ron::de::from_str::<CoreDevice>(&raw).ok()?;
+    (device.pair_state == PairState::Paired).then_some(device)
+}
+
+async fn load_persisted_paired_devices() -> Vec<CoreDevice> {
+    let Some(config_dir) = dirs::config_dir() else {
+        return Vec::new();
+    };
+    let kc_dir = config_dir.join(CONFIG_DIR);
+    let Ok(mut entries) = tokio::fs::read_dir(&kc_dir).await else {
+        return Vec::new();
+    };
+
+    let mut devices = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("ron") {
+            continue;
+        }
+        if let Ok(raw) = tokio::fs::read_to_string(&path).await
+            && let Ok(device) = ron::de::from_str::<CoreDevice>(&raw)
+            && device.pair_state == PairState::Paired
+        {
+            devices.push(device);
+        }
+    }
+    devices
+}
+
+async fn reconcile_persisted_pair_state(devices: &Arc<Mutex<HashMap<String, DbusDevice>>>) {
+    let persisted_devices = load_persisted_paired_devices().await;
+    if persisted_devices.is_empty() {
+        return;
+    }
+
+    let mut map = devices.lock().await;
+    for device in persisted_devices {
+        let reachable = map
+            .get(&device.device_id.0)
+            .map(|device| device.is_reachable)
+            .unwrap_or(false);
+        map.insert(
+            device.device_id.0.clone(),
+            dbus_device_from_core(&device, reachable),
+        );
+    }
+}
+
 // ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sms_conversation_request_uses_gsconnect_thread_id_shape() {
+        assert_eq!(sms_conversation_request_body(42), json!({ "threadID": 42 }));
+    }
+
+    #[test]
+    fn sms_send_request_includes_modern_and_legacy_android_payloads() {
+        assert_eq!(
+            sms_send_request_body("555-555-5555", "message body"),
+            json!({
+                "addresses": [{ "address": "555-555-5555" }],
+                "version": 2,
+                "sendSms": true,
+                "phoneNumber": "555-555-5555",
+                "messageBody": "message body",
+            })
+        );
+    }
+}
 
 /// Main daemon D-Bus interface
 pub struct DaemonInterface {
@@ -128,6 +222,7 @@ impl DaemonInterface {
     /// List all known devices
     async fn list_devices(&self) -> Vec<DbusDevice> {
         info!("D-Bus: ListDevices called");
+        reconcile_persisted_pair_state(&self.devices).await;
         let devices = self.devices.lock().await;
         let device_list: Vec<DbusDevice> = devices.values().cloned().collect();
         info!("D-Bus: Returning {} devices", device_list.len());
@@ -144,11 +239,32 @@ impl DaemonInterface {
     }
 
     /// Unpair from a device
-    async fn unpair_device(&self, device_id: String) -> zbus::fdo::Result<()> {
+    async fn unpair_device(
+        &self,
+        #[zbus(signal_emitter)] signal_emitter: SignalEmitter<'_>,
+        device_id: String,
+    ) -> zbus::fdo::Result<()> {
         info!("D-Bus: UnpairDevice called for {}", device_id);
         self.event_sender
-            .send(AppEvent::Unpair(DeviceId(device_id)))
+            .send(AppEvent::Unpair(DeviceId(device_id.clone())))
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        let updated_device = {
+            let mut devices = self.devices.lock().await;
+            if let Some(device) = devices.get_mut(&device_id) {
+                device.is_paired = false;
+                Some(device.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(device) = updated_device {
+            DaemonInterface::device_connected(&signal_emitter, device_id, device)
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
+
         Ok(())
     }
 
@@ -158,9 +274,8 @@ impl DaemonInterface {
             "D-Bus: SendPing called for {} with message: {}",
             device_id, message
         );
-        let packet = ProtocolPacket::new(PacketType::Ping, json!({ "message": message }));
         self.event_sender
-            .send(AppEvent::SendPacket(DeviceId(device_id), packet))
+            .send(AppEvent::Ping((DeviceId(device_id), message)))
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
@@ -198,6 +313,16 @@ impl DaemonInterface {
         Ok(())
     }
 
+    /// Request the remote filesystem over SFTP.
+    async fn browse_device_filesystem(&self, device_id: String) -> zbus::fdo::Result<()> {
+        info!("D-Bus: BrowseDeviceFilesystem called for {}", device_id);
+        let packet = ProtocolPacket::new(PacketType::SftpRequest, json!({ "startBrowsing": true }));
+        self.event_sender
+            .send(AppEvent::SendPacket(DeviceId(device_id), packet))
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(())
+    }
+
     /// Enable or disable a plugin for a device.
     /// Changes take effect immediately and are persisted across restarts.
     async fn set_plugin_enabled(
@@ -222,14 +347,10 @@ impl DaemonInterface {
 
     /// Return the list of disabled plugin IDs for a device.
     async fn get_disabled_plugins(&self, device_id: String) -> Vec<String> {
-        let path = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("kdeconnect")
-            .join(format!("{}_plugins.json", device_id));
-        match tokio::fs::read_to_string(&path).await {
-            Ok(json) => serde_json::from_str::<Vec<String>>(&json).unwrap_or_default(),
-            Err(_) => vec![],
-        }
+        kdeconnect_core::plugin_config::load_disabled_plugins(&device_id)
+            .await
+            .into_iter()
+            .collect()
     }
 
     /// Trigger a UDP identity broadcast to discover nearby devices.
@@ -245,7 +366,9 @@ impl DaemonInterface {
     async fn accept_pairing(&self, device_id: String) -> zbus::fdo::Result<()> {
         info!("D-Bus: AcceptPairing called for {}", device_id);
         self.event_sender
-            .send(AppEvent::AcceptPairing(kdeconnect_core::device::DeviceId(device_id)))
+            .send(AppEvent::AcceptPairing(kdeconnect_core::device::DeviceId(
+                device_id,
+            )))
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
@@ -254,7 +377,9 @@ impl DaemonInterface {
     async fn reject_pairing(&self, device_id: String) -> zbus::fdo::Result<()> {
         info!("D-Bus: RejectPairing called for {}", device_id);
         self.event_sender
-            .send(AppEvent::RejectPairing(kdeconnect_core::device::DeviceId(device_id)))
+            .send(AppEvent::RejectPairing(kdeconnect_core::device::DeviceId(
+                device_id,
+            )))
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
@@ -265,6 +390,13 @@ impl DaemonInterface {
         signal_emitter: &SignalEmitter<'_>,
         device_id: String,
         device_name: String,
+    ) -> zbus::Result<()>;
+
+    /// Signal: A pairing request finished, failed, or is no longer actionable.
+    #[zbus(signal)]
+    async fn pairing_finished(
+        signal_emitter: &SignalEmitter<'_>,
+        device_id: String,
     ) -> zbus::Result<()>;
 
     /// Signal: Device connected
@@ -323,10 +455,7 @@ impl DaemonInterface {
     /// Execute a remote command on a device by key
     async fn run_command(&self, device_id: String, key: String) -> zbus::fdo::Result<()> {
         info!("D-Bus: RunCommand called for {} key={}", device_id, key);
-        let packet = ProtocolPacket::new(
-            PacketType::RunCommandRequest,
-            json!({ "key": key }),
-        );
+        let packet = ProtocolPacket::new(PacketType::RunCommandRequest, json!({ "key": key }));
         self.event_sender
             .send(AppEvent::SendPacket(DeviceId(device_id), packet))
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -364,6 +493,20 @@ pub struct SmsInterface {
     current_device_id: Arc<Mutex<Option<String>>>,
 }
 
+fn sms_conversation_request_body(thread_id: i64) -> serde_json::Value {
+    json!({ "threadID": thread_id })
+}
+
+fn sms_send_request_body(phone_number: &str, message: &str) -> serde_json::Value {
+    json!({
+        "addresses": [{ "address": phone_number }],
+        "version": 2,
+        "sendSms": true,
+        "phoneNumber": phone_number,
+        "messageBody": message,
+    })
+}
+
 #[interface(name = "io.github.hepp3n.kdeconnect.Sms")]
 impl SmsInterface {
     /// Return cached SMS JSON — in-memory first, disk fallback, empty if neither
@@ -372,10 +515,7 @@ impl SmsInterface {
             debug!("Returning in-memory SMS cache ({} bytes)", json.len());
             return json.clone();
         }
-        match load_sms_cache(&device_id).await {
-            Some(json) => json,
-            None => String::new(),
-        }
+        load_sms_cache(&device_id).await.unwrap_or_default()
     }
 
     /// Request all conversations from device
@@ -404,7 +544,7 @@ impl SmsInterface {
         );
         let packet = ProtocolPacket::new(
             PacketType::SmsRequestConversation,
-            json!({ "threadID": thread_id }),
+            sms_conversation_request_body(thread_id),
         );
         self.event_sender
             .send(AppEvent::SendPacket(DeviceId(device_id), packet))
@@ -429,12 +569,7 @@ impl SmsInterface {
         );
         let packet = ProtocolPacket::new(
             PacketType::SmsRequest,
-            json!({
-                "sendSms": true,
-                "addresses": [{ "address": phone_number }],
-                "messageBody": message,
-                "version": 2
-            }),
+            sms_send_request_body(&phone_number, &message),
         );
         self.event_sender
             .send(AppEvent::SendPacket(DeviceId(device_id), packet))
@@ -540,12 +675,6 @@ impl KdeConnectService {
     pub async fn new() -> Result<Self> {
         info!("Initializing KDE Connect D-Bus service");
 
-        let connection = Connection::session().await?;
-        info!("D-Bus session connection established");
-
-        connection.request_name(SERVICE_NAME).await?;
-        info!("D-Bus service name '{}' registered", SERVICE_NAME);
-
         info!("Initializing kdeconnect-core");
         let (mut core, mut event_receiver) = KdeConnectCore::new().await?;
         let event_sender = core.take_events();
@@ -556,34 +685,10 @@ impl KdeConnectService {
         // Pre-populate known paired devices as offline so list_devices() returns
         // them immediately after reboot, before the phone actively reconnects.
         {
-            use kdeconnect_core::{config::CONFIG_DIR, device::Device as CoreDevice};
             let mut map = devices.lock().await;
-            if let Some(config_dir) = dirs::config_dir() {
-                let kc_dir = config_dir.join(CONFIG_DIR);
-                if let Ok(mut entries) = tokio::fs::read_dir(&kc_dir).await {
-                    while let Ok(Some(entry)) = entries.next_entry().await {
-                        let path = entry.path();
-                        if path.extension().and_then(|e| e.to_str()) == Some("ron") {
-                            if let Ok(raw) = tokio::fs::read_to_string(&path).await {
-                                if let Ok(dev) = ron::de::from_str::<CoreDevice>(&raw) {
-                                    if dev.pair_state == PairState::Paired {
-                                        info!("Restoring offline paired device: {}", dev.name);
-                                        map.insert(
-                                            dev.device_id.0.clone(),
-                                            DbusDevice {
-                                                id: dev.device_id.0.clone(),
-                                                name: dev.name.clone(),
-                                                device_type: "phone".to_string(),
-                                                is_paired: true,
-                                                is_reachable: false,
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            for dev in load_persisted_paired_devices().await {
+                info!("Restoring offline paired device: {}", dev.name);
+                map.insert(dev.device_id.0.clone(), dbus_device_from_core(&dev, false));
             }
         }
 
@@ -591,11 +696,6 @@ impl KdeConnectService {
             event_sender: event_sender.clone(),
             devices: devices.clone(),
         };
-        connection
-            .object_server()
-            .at(DAEMON_PATH, daemon_interface)
-            .await?;
-        info!("Daemon interface registered at {}", DAEMON_PATH);
 
         let sms_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let current_device_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -605,24 +705,26 @@ impl KdeConnectService {
             sms_cache: sms_cache.clone(),
             current_device_id: current_device_id.clone(),
         };
-        connection
-            .object_server()
-            .at(SMS_PATH, sms_interface)
-            .await?;
-        info!("SMS interface registered at {}", SMS_PATH);
 
         let contacts_interface = ContactsInterface {
             event_sender: event_sender.clone(),
         };
-        connection
-            .object_server()
-            .at(CONTACTS_PATH, contacts_interface)
+
+        let connection = zbus::connection::Builder::session()?
+            .serve_at(DAEMON_PATH, daemon_interface)?
+            .serve_at(SMS_PATH, sms_interface)?
+            .serve_at(CONTACTS_PATH, contacts_interface)?
+            .name(SERVICE_NAME)?
+            .build()
             .await?;
+        info!("D-Bus session connection established");
+        info!("D-Bus service name '{}' registered", SERVICE_NAME);
+        info!("Daemon interface registered at {}", DAEMON_PATH);
+        info!("SMS interface registered at {}", SMS_PATH);
         info!("Contacts interface registered at {}", CONTACTS_PATH);
 
         let conn_clone = connection.clone();
         let devices_clone = devices.clone();
-        let event_sender_clone = event_sender.clone();
         let sms_synced: SmsSyncedSet = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
         tokio::spawn(async move {
@@ -632,7 +734,6 @@ impl KdeConnectService {
                     &conn_clone,
                     event,
                     &devices_clone,
-                    &event_sender_clone,
                     &sms_cache,
                     &current_device_id,
                     &sms_synced,
@@ -651,7 +752,9 @@ impl KdeConnectService {
         tokio::spawn(async move {
             match core_handle.await {
                 Ok(_) => error!("Core event loop exited unexpectedly - connections will fail"),
-                Err(e) if e.is_panic() => error!("Core event loop PANICKED - connections will fail: {:?}", e),
+                Err(e) if e.is_panic() => {
+                    error!("Core event loop PANICKED - connections will fail: {:?}", e)
+                }
                 Err(e) => error!("Core event loop cancelled: {:?}", e),
             }
         });
@@ -667,7 +770,6 @@ impl KdeConnectService {
         connection: &Connection,
         event: ConnectionEvent,
         devices: &Arc<Mutex<HashMap<String, DbusDevice>>>,
-        event_sender: &Arc<mpsc::UnboundedSender<AppEvent>>,
         sms_cache: &Arc<Mutex<Option<String>>>,
         current_device_id: &Arc<Mutex<Option<String>>>,
         sms_synced: &SmsSyncedSet,
@@ -682,7 +784,9 @@ impl KdeConnectService {
                 let dbus_device = DbusDevice {
                     id: device_id.0.clone(),
                     name: device.name.clone(),
-                    device_type: "phone".to_string(),
+                    device_type: device.device_type.clone(),
+                    incoming_capabilities: device.incoming_capabilities.clone(),
+                    outgoing_capabilities: device.outgoing_capabilities.clone(),
                     is_paired,
                     is_reachable: true,
                 };
@@ -708,29 +812,29 @@ impl KdeConnectService {
                 if is_paired {
                     let did = device_id.0.clone();
 
-                    if let Some(cached) = load_contacts_cache(&did).await {
-                        if let Ok(contacts_json) = serde_json::to_string(&cached) {
-                            let iface_ref = connection
-                                .object_server()
-                                .interface::<_, ContactsInterface>(CONTACTS_PATH)
-                                .await?;
-                            ContactsInterface::contacts_received(
-                                iface_ref.signal_emitter(),
-                                contacts_json,
-                            )
+                    if let Some(cached) = load_contacts_cache(&did).await
+                        && let Ok(contacts_json) = serde_json::to_string(&cached)
+                    {
+                        let iface_ref = connection
+                            .object_server()
+                            .interface::<_, ContactsInterface>(CONTACTS_PATH)
                             .await?;
-                            debug!(
-                                "Emitted cached contacts on connect ({} entries)",
-                                cached.len()
-                            );
-                        }
+                        ContactsInterface::contacts_received(
+                            iface_ref.signal_emitter(),
+                            contacts_json,
+                        )
+                        .await?;
+                        debug!(
+                            "Emitted cached contacts on connect ({} entries)",
+                            cached.len()
+                        );
                     }
 
-                    if sms_cache.lock().await.is_none() {
-                        if let Some(cached_sms) = load_sms_cache(&did).await {
-                            *sms_cache.lock().await = Some(cached_sms);
-                            debug!("Seeded in-memory SMS cache from disk on connect");
-                        }
+                    if sms_cache.lock().await.is_none()
+                        && let Some(cached_sms) = load_sms_cache(&did).await
+                    {
+                        *sms_cache.lock().await = Some(cached_sms);
+                        debug!("Seeded in-memory SMS cache from disk on connect");
                     }
 
                     let already_synced = sms_synced.lock().await.contains(&device_id.0);
@@ -750,7 +854,9 @@ impl KdeConnectService {
                 let dbus_device = DbusDevice {
                     id: device_id.0.clone(),
                     name: device.name.clone(),
-                    device_type: "phone".to_string(),
+                    device_type: device.device_type.clone(),
+                    incoming_capabilities: device.incoming_capabilities.clone(),
+                    outgoing_capabilities: device.outgoing_capabilities.clone(),
                     is_paired: true,
                     is_reachable: true,
                 };
@@ -771,25 +877,12 @@ impl KdeConnectService {
                     dbus_device,
                 )
                 .await?;
+                DaemonInterface::pairing_finished(iface_ref.signal_emitter(), device_id.0.clone())
+                    .await?;
                 debug!("Device paired signal emitted");
 
-                let sender = event_sender.clone();
-                let did = device_id.0.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let sms_packet =
-                        ProtocolPacket::new(PacketType::SmsRequestConversations, json!({}));
-                    let _ = sender.send(AppEvent::SendPacket(DeviceId(did.clone()), sms_packet));
-                    debug!("Auto-requested SMS conversations after pairing");
-
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let contacts_packet = ProtocolPacket::new(
-                        PacketType::ContactsRequestAllUidsTimestamps,
-                        json!({}),
-                    );
-                    let _ = sender.send(AppEvent::SendPacket(DeviceId(did), contacts_packet));
-                    debug!("Auto-requested contacts after pairing");
-                });
+                // Initial plugin sync is handled in kdeconnect-core, where it can
+                // respect per-device plugin enablement before sending packets.
             }
             ConnectionEvent::Disconnected(device_id) => {
                 info!("Device disconnected: {}", device_id.0);
@@ -820,13 +913,18 @@ impl KdeConnectService {
                 debug!("Device disconnected signal emitted");
             }
             ConnectionEvent::PairStateChanged((device_id, pair_state)) => {
-                info!("Event: PairStateChanged - {} → {:?}", device_id.0, pair_state);
-                let is_paired = matches!(pair_state, PairState::Paired);
-
+                info!(
+                    "Event: PairStateChanged - {} → {:?}",
+                    device_id.0, pair_state
+                );
                 {
                     let mut map = devices.lock().await;
                     if let Some(dev) = map.get_mut(&device_id.0) {
-                        dev.is_paired = is_paired;
+                        match pair_state {
+                            PairState::Paired => dev.is_paired = true,
+                            PairState::NotPaired => dev.is_paired = false,
+                            PairState::Requesting | PairState::Requested => {}
+                        }
                     }
                 }
 
@@ -844,6 +942,13 @@ impl KdeConnectService {
                     )
                     .await?;
                 }
+                if matches!(pair_state, PairState::NotPaired | PairState::Paired) {
+                    DaemonInterface::pairing_finished(
+                        iface_ref.signal_emitter(),
+                        device_id.0.clone(),
+                    )
+                    .await?;
+                }
                 debug!("PairStateChanged signal emitted for {}", device_id.0);
             }
             ConnectionEvent::SmsMessages(sms_data) => {
@@ -857,7 +962,9 @@ impl KdeConnectService {
 
                 *sms_cache.lock().await = Some(messages_json.clone());
 
-                if let Some(did) = current_device_id.lock().await.as_deref() {
+                if let Some(did) = sms_data.device_id.as_deref() {
+                    save_sms_cache(did, &messages_json).await;
+                } else if let Some(did) = current_device_id.lock().await.as_deref() {
                     save_sms_cache(did, &messages_json).await;
                 }
 
@@ -870,12 +977,10 @@ impl KdeConnectService {
                     .await?;
                 debug!("SMS D-Bus signal emitted");
             }
-            ConnectionEvent::ContactsReceived(contacts) => {
+            ConnectionEvent::ContactsReceived(device_id, contacts) => {
                 info!("Contacts received: {} entries", contacts.len());
 
-                if let Some(did) = current_device_id.lock().await.as_deref() {
-                    save_contacts_cache(did, &contacts).await;
-                }
+                save_contacts_cache(&device_id.0, &contacts).await;
 
                 let contacts_json = serde_json::to_string(&contacts)?;
 
@@ -919,6 +1024,50 @@ impl KdeConnectService {
                 // The D-Bus signal is the primary mechanism — the applet
                 // subscription delivers it immediately and opens the popup.
             }
+            ConnectionEvent::PairingTimedOut(device_id) => {
+                info!("Pairing timed out for {}", device_id.0);
+                // Update the device to reflect the unpaired state and emit a
+                // device_connected signal so the applet refreshes immediately.
+                let persisted_paired = load_persisted_paired_device(&device_id.0).await;
+                {
+                    let mut map = devices.lock().await;
+                    if let Some(device) = persisted_paired {
+                        let reachable = map
+                            .get(&device_id.0)
+                            .map(|device| device.is_reachable)
+                            .unwrap_or(false);
+                        map.insert(
+                            device_id.0.clone(),
+                            dbus_device_from_core(&device, reachable),
+                        );
+                    } else if let Some(dev) = map.get_mut(&device_id.0) {
+                        dev.is_paired = false;
+                    }
+                }
+                let iface_ref = connection
+                    .object_server()
+                    .interface::<_, DaemonInterface>(DAEMON_PATH)
+                    .await?;
+                if let Some(dev) = devices.lock().await.get(&device_id.0).cloned() {
+                    DaemonInterface::device_connected(
+                        iface_ref.signal_emitter(),
+                        device_id.0.clone(),
+                        dev,
+                    )
+                    .await?;
+                }
+                DaemonInterface::pairing_finished(iface_ref.signal_emitter(), device_id.0.clone())
+                    .await?;
+                debug!("PairingTimedOut signal emitted for {}", device_id.0);
+            }
+            ConnectionEvent::PairingFinished(device_id) => {
+                let iface_ref = connection
+                    .object_server()
+                    .interface::<_, DaemonInterface>(DAEMON_PATH)
+                    .await?;
+                DaemonInterface::pairing_finished(iface_ref.signal_emitter(), device_id.0).await?;
+                debug!("PairingFinished D-Bus signal emitted");
+            }
             ConnectionEvent::ClipboardReceived(content) => {
                 info!("Clipboard received ({} bytes)", content.len());
 
@@ -926,18 +1075,10 @@ impl KdeConnectService {
                     .object_server()
                     .interface::<_, DaemonInterface>(DAEMON_PATH)
                     .await?;
-                DaemonInterface::clipboard_received(iface_ref.signal_emitter(), content)
-                    .await?;
+                DaemonInterface::clipboard_received(iface_ref.signal_emitter(), content).await?;
                 debug!("ClipboardReceived D-Bus signal emitted");
             }
-            ConnectionEvent::StateUpdated(state) => {
-                let device_id = match current_device_id.lock().await.clone() {
-                    Some(id) => id,
-                    None => {
-                        debug!("StateUpdated but no current device id");
-                        return Ok(());
-                    }
-                };
+            ConnectionEvent::StateUpdated((device_id, state)) => {
                 let iface_ref = connection
                     .object_server()
                     .interface::<_, DaemonInterface>(DAEMON_PATH)
@@ -946,8 +1087,8 @@ impl KdeConnectService {
                     DeviceState::Battery { level, charging } => {
                         DaemonInterface::battery_received(
                             iface_ref.signal_emitter(),
-                            device_id,
-                            level as i32,
+                            device_id.0,
+                            level,
                             charging,
                         )
                         .await?;
@@ -956,7 +1097,7 @@ impl KdeConnectService {
                     DeviceState::Connectivity((_, signal_strength)) => {
                         DaemonInterface::connectivity_received(
                             iface_ref.signal_emitter(),
-                            device_id,
+                            device_id.0,
                             signal_strength,
                         )
                         .await?;

@@ -21,6 +21,8 @@ pub struct Device {
     pub id: String,
     pub name: String,
     pub device_type: String,
+    pub incoming_capabilities: Vec<String>,
+    pub outgoing_capabilities: Vec<String>,
     pub is_paired: bool,
     pub is_reachable: bool,
 }
@@ -34,6 +36,7 @@ pub enum ServiceEvent {
     SmsMessagesReceived(String),               // JSON string
     ContactsReceived(HashMap<String, String>), // phone -> name
     PairingRequested(String, String),          // device_id, device_name
+    PairingFinished(String),                   // device_id
     ClipboardReceived(String),                 // clipboard content from phone
     BatteryReceived(String, i32, bool),        // device_id, level, is_charging
     ConnectivityReceived(String, i32),         // device_id, signal_strength
@@ -54,6 +57,7 @@ trait Daemon {
     async fn send_files(&self, device_id: &str, files: Vec<String>) -> zbus::Result<()>;
     async fn send_clipboard(&self, device_id: &str, content: &str) -> zbus::Result<()>;
     async fn ring_device(&self, device_id: &str) -> zbus::Result<()>;
+    async fn browse_device_filesystem(&self, device_id: &str) -> zbus::Result<()>;
     async fn set_plugin_enabled(
         &self,
         device_id: &str,
@@ -69,6 +73,9 @@ trait Daemon {
 
     #[zbus(signal)]
     async fn pairing_requested(&self, device_id: String, device_name: String) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn pairing_finished(&self, device_id: String) -> zbus::Result<()>;
 
     #[zbus(signal)]
     async fn update_transfer_progress(&self, progress: u8) -> zbus::Result<()>;
@@ -201,6 +208,14 @@ impl KdeConnectClient {
         Ok(self.daemon_proxy.ring_device(device_id).await?)
     }
 
+    /// Request the remote filesystem over SFTP.
+    pub async fn browse_device_filesystem(&self, device_id: &str) -> Result<()> {
+        Ok(self
+            .daemon_proxy
+            .browse_device_filesystem(device_id)
+            .await?)
+    }
+
     /// Enable or disable a plugin for a device
     pub async fn set_plugin_enabled(
         &self,
@@ -255,12 +270,7 @@ impl KdeConnectClient {
     }
 
     /// Send an SMS message
-    pub async fn send_sms(
-        &self,
-        device_id: &str,
-        phone_number: &str,
-        message: &str,
-    ) -> Result<()> {
+    pub async fn send_sms(&self, device_id: &str, phone_number: &str, message: &str) -> Result<()> {
         Ok(self
             .sms_proxy
             .send_sms(device_id, phone_number, message)
@@ -283,144 +293,258 @@ impl KdeConnectClient {
     }
 
     /// Create a stream of service events
-    pub async fn listen_for_events(
-        &self,
-    ) -> futures::stream::BoxStream<'static, ServiceEvent> {
+    pub async fn listen_for_events(&self) -> futures::stream::BoxStream<'static, ServiceEvent> {
         use futures::stream::select_all;
 
         let connected = self
             .daemon_proxy
             .receive_device_connected()
             .await
-            .unwrap()
             .map(|s| {
-                let args = s.args().unwrap();
-                ServiceEvent::DeviceConnected(args.device_id.clone(), args.device.clone())
-            });
+                s.filter_map(|signal| async move {
+                    match signal.args() {
+                        Ok(args) => Some(ServiceEvent::DeviceConnected(
+                            args.device_id.clone(),
+                            args.device.clone(),
+                        )),
+                        Err(e) => {
+                            error!("Failed to parse DeviceConnected signal: {:?}", e);
+                            None
+                        }
+                    }
+                })
+            })
+            .map(|s| Box::pin(s) as futures::stream::BoxStream<'static, ServiceEvent>)
+            .unwrap_or_else(|_| Box::pin(futures::stream::empty()));
 
         let paired = self
             .daemon_proxy
             .receive_device_paired()
             .await
-            .unwrap()
             .map(|s| {
-                let args = s.args().unwrap();
-                ServiceEvent::DevicePaired(args.device_id.clone(), args.device.clone())
-            });
+                s.filter_map(|signal| async move {
+                    match signal.args() {
+                        Ok(args) => Some(ServiceEvent::DevicePaired(
+                            args.device_id.clone(),
+                            args.device.clone(),
+                        )),
+                        Err(e) => {
+                            error!("Failed to parse DevicePaired signal: {:?}", e);
+                            None
+                        }
+                    }
+                })
+            })
+            .map(|s| Box::pin(s) as futures::stream::BoxStream<'static, ServiceEvent>)
+            .unwrap_or_else(|_| Box::pin(futures::stream::empty()));
 
         let disconnected = self
             .daemon_proxy
             .receive_device_disconnected()
             .await
-            .unwrap()
             .map(|s| {
-                let args = s.args().unwrap();
-                ServiceEvent::DeviceDisconnected(args.device_id.clone())
-            });
+                s.filter_map(|signal| async move {
+                    match signal.args() {
+                        Ok(args) => Some(ServiceEvent::DeviceDisconnected(args.device_id.clone())),
+                        Err(e) => {
+                            error!("Failed to parse DeviceDisconnected signal: {:?}", e);
+                            None
+                        }
+                    }
+                })
+            })
+            .map(|s| Box::pin(s) as futures::stream::BoxStream<'static, ServiceEvent>)
+            .unwrap_or_else(|_| Box::pin(futures::stream::empty()));
 
         let sms = self
             .sms_proxy
             .receive_sms_messages_received()
             .await
-            .unwrap()
             .map(|s| {
-                let args = s.args().unwrap();
-                ServiceEvent::SmsMessagesReceived(args.messages_json.clone())
-            });
+                s.filter_map(|signal| async move {
+                    match signal.args() {
+                        Ok(args) => Some(ServiceEvent::SmsMessagesReceived(
+                            args.messages_json.clone(),
+                        )),
+                        Err(e) => {
+                            error!("Failed to parse SMS signal: {:?}", e);
+                            None
+                        }
+                    }
+                })
+            })
+            .map(|s| Box::pin(s) as futures::stream::BoxStream<'static, ServiceEvent>)
+            .unwrap_or_else(|_| Box::pin(futures::stream::empty()));
 
         let contacts = self
             .contacts_proxy
             .receive_contacts_received()
             .await
-            .unwrap()
             .map(|s| {
-                let args = s.args().unwrap();
-                let contacts_json = args.contacts_json.clone();
-                let map: HashMap<String, String> =
-                    serde_json::from_str(&contacts_json).unwrap_or_default();
-                ServiceEvent::ContactsReceived(map)
-            });
+                s.filter_map(|signal| async move {
+                    match signal.args() {
+                        Ok(args) => {
+                            let contacts_json = args.contacts_json.clone();
+                            let map: HashMap<String, String> =
+                                serde_json::from_str(&contacts_json).unwrap_or_default();
+                            Some(ServiceEvent::ContactsReceived(map))
+                        }
+                        Err(e) => {
+                            error!("Failed to parse Contacts signal: {:?}", e);
+                            None
+                        }
+                    }
+                })
+            })
+            .map(|s| Box::pin(s) as futures::stream::BoxStream<'static, ServiceEvent>)
+            .unwrap_or_else(|_| Box::pin(futures::stream::empty()));
 
         let pairing_req = self
             .daemon_proxy
             .receive_pairing_requested()
             .await
-            .unwrap()
             .map(|s| {
-                let args = s.args().unwrap();
-                ServiceEvent::PairingRequested(
-                    args.device_id.clone(),
-                    args.device_name.clone(),
-                )
-            });
+                s.filter_map(|signal| async move {
+                    match signal.args() {
+                        Ok(args) => Some(ServiceEvent::PairingRequested(
+                            args.device_id.clone(),
+                            args.device_name.clone(),
+                        )),
+                        Err(e) => {
+                            error!("Failed to parse PairingRequested signal: {:?}", e);
+                            None
+                        }
+                    }
+                })
+            })
+            .map(|s| Box::pin(s) as futures::stream::BoxStream<'static, ServiceEvent>)
+            .unwrap_or_else(|_| Box::pin(futures::stream::empty()));
+
+        let pairing_finished = self
+            .daemon_proxy
+            .receive_pairing_finished()
+            .await
+            .map(|s| {
+                s.filter_map(|signal| async move {
+                    match signal.args() {
+                        Ok(args) => Some(ServiceEvent::PairingFinished(args.device_id.clone())),
+                        Err(e) => {
+                            error!("Failed to parse PairingFinished signal: {:?}", e);
+                            None
+                        }
+                    }
+                })
+            })
+            .map(|s| Box::pin(s) as futures::stream::BoxStream<'static, ServiceEvent>)
+            .unwrap_or_else(|_| Box::pin(futures::stream::empty()));
 
         let clipboard = self
             .daemon_proxy
             .receive_clipboard_received()
             .await
-            .unwrap()
             .map(|s| {
-                let args = s.args().unwrap();
-                ServiceEvent::ClipboardReceived(args.content.clone())
-            });
+                s.filter_map(|signal| async move {
+                    match signal.args() {
+                        Ok(args) => Some(ServiceEvent::ClipboardReceived(args.content.clone())),
+                        Err(e) => {
+                            error!("Failed to parse Clipboard signal: {:?}", e);
+                            None
+                        }
+                    }
+                })
+            })
+            .map(|s| Box::pin(s) as futures::stream::BoxStream<'static, ServiceEvent>)
+            .unwrap_or_else(|_| Box::pin(futures::stream::empty()));
 
         let battery = self
             .daemon_proxy
             .receive_battery_received()
             .await
-            .unwrap()
             .map(|s| {
-                let args = s.args().unwrap();
-                ServiceEvent::BatteryReceived(
-                    args.device_id.clone(),
-                    args.level,
-                    args.is_charging,
-                )
-            });
+                s.filter_map(|signal| async move {
+                    match signal.args() {
+                        Ok(args) => Some(ServiceEvent::BatteryReceived(
+                            args.device_id.clone(),
+                            args.level,
+                            args.is_charging,
+                        )),
+                        Err(e) => {
+                            error!("Failed to parse Battery signal: {:?}", e);
+                            None
+                        }
+                    }
+                })
+            })
+            .map(|s| Box::pin(s) as futures::stream::BoxStream<'static, ServiceEvent>)
+            .unwrap_or_else(|_| Box::pin(futures::stream::empty()));
 
         let connectivity = self
             .daemon_proxy
             .receive_connectivity_received()
             .await
-            .unwrap()
             .map(|s| {
-                let args = s.args().unwrap();
-                ServiceEvent::ConnectivityReceived(args.device_id.clone(), args.signal_strength)
-            });
+                s.filter_map(|signal| async move {
+                    match signal.args() {
+                        Ok(args) => Some(ServiceEvent::ConnectivityReceived(
+                            args.device_id.clone(),
+                            args.signal_strength,
+                        )),
+                        Err(e) => {
+                            error!("Failed to parse Connectivity signal: {:?}", e);
+                            None
+                        }
+                    }
+                })
+            })
+            .map(|s| Box::pin(s) as futures::stream::BoxStream<'static, ServiceEvent>)
+            .unwrap_or_else(|_| Box::pin(futures::stream::empty()));
 
         let run_command_list = self
             .daemon_proxy
             .receive_run_command_list_received()
             .await
-            .unwrap()
             .map(|s| {
-                let args = s.args().unwrap();
-                ServiceEvent::RunCommandListReceived(
-                    args.device_id.clone(),
-                    args.commands_json.clone(),
-                )
-            });
+                s.filter_map(|signal| async move {
+                    match signal.args() {
+                        Ok(args) => Some(ServiceEvent::RunCommandListReceived(
+                            args.device_id.clone(),
+                            args.commands_json.clone(),
+                        )),
+                        Err(e) => {
+                            error!("Failed to parse RunCommandList signal: {:?}", e);
+                            None
+                        }
+                    }
+                })
+            })
+            .map(|s| Box::pin(s) as futures::stream::BoxStream<'static, ServiceEvent>)
+            .unwrap_or_else(|_| Box::pin(futures::stream::empty()));
 
         Box::pin(select_all(vec![
-            Box::pin(connected) as futures::stream::BoxStream<'static, ServiceEvent>,
-            Box::pin(paired),
-            Box::pin(disconnected),
-            Box::pin(sms),
-            Box::pin(contacts),
-            Box::pin(pairing_req),
-            Box::pin(clipboard),
-            Box::pin(battery),
-            Box::pin(connectivity),
-            Box::pin(run_command_list),
+            connected,
+            paired,
+            disconnected,
+            sms,
+            contacts,
+            pairing_req,
+            pairing_finished,
+            clipboard,
+            battery,
+            connectivity,
+            run_command_list,
         ]))
     }
 
     pub async fn transfer_progress_stream(&self) -> impl futures::stream::Stream<Item = u8> {
-        let daemon_update_transfer_progress = self
-            .daemon_proxy
-            .receive_update_transfer_progress()
-            .await
-            .unwrap();
+        let daemon_update_transfer_progress =
+            match self.daemon_proxy.receive_update_transfer_progress().await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Failed to subscribe to transfer progress: {:?}", e);
+                    return Box::pin(futures::stream::empty())
+                        as futures::stream::BoxStream<'static, u8>;
+                }
+            };
 
         let update_transfer_stream =
             daemon_update_transfer_progress.filter_map(|signal| async move {
@@ -433,8 +557,6 @@ impl KdeConnectClient {
                 }
             });
 
-        let result = Box::pin(update_transfer_stream);
-
-        futures::stream::select_all(vec![result])
+        Box::pin(update_transfer_stream)
     }
 }
