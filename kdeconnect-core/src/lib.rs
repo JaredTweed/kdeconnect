@@ -16,7 +16,7 @@ use crate::{
     plugin_interface::PluginRegistry,
     plugins::{ping::Ping, share::ShareRequest},
     protocol::{DeviceFile, DevicePayload, Pair},
-    transport::{TcpTransport, TransportEvent, UdpTransport},
+    transport::{ConnectionRateLimiter, TcpTransport, TransportEvent, UdpTransport},
 };
 
 pub mod config;
@@ -83,8 +83,10 @@ impl KdeConnectCore {
         let device_manager = DeviceManager::new(event_tx.clone());
         let pairing = Arc::new(PairingManager::new(device_manager.clone()));
 
-        let tcp_transport = TcpTransport::new(&transport_tx);
-        let udp_transport = Arc::new(UdpTransport::new(&transport_tx).await);
+        let connection_rate_limiter = Arc::new(ConnectionRateLimiter::default());
+        let tcp_transport = TcpTransport::new(&transport_tx, connection_rate_limiter.clone());
+        let udp_transport =
+            Arc::new(UdpTransport::new(&transport_tx, connection_rate_limiter).await);
 
         tokio::spawn(async move {
             if let Err(e) = tcp_transport.listen().await {
@@ -430,6 +432,10 @@ impl KdeConnectCore {
                 let conn_event = ConnectionEvent::Disconnected(id);
                 let _ = self.conn_tx.send(conn_event.clone());
                 let _ = self.mpris_conn_tx.send(conn_event);
+            }
+            TransportEvent::PairTrustFailed { id, .. }
+            | TransportEvent::PacketSendFailed { id, .. } => {
+                debug!("[core] transport reported connection failure for {}", id);
             }
         }
     }

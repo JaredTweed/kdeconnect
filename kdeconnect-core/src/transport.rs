@@ -1,32 +1,51 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustls::pki_types::ServerName;
 use socket2::TcpKeepalive;
 use tokio::{
-    io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt, BufReader, split},
+    io::{
+        AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt, BufReader,
+        split,
+    },
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, watch},
     time::MissedTickBehavior,
 };
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, error, info, warn};
 
 use crate::{
     GLOBAL_CONFIG,
-    device::DeviceId,
+    device::{Device, DeviceId, PairState},
     plugin_config,
     protocol::{Identity, PacketType, ProtocolPacket},
 };
+use std::sync::Mutex as StdMutex;
+
+use once_cell::sync::Lazy;
 
 pub const DEFAULT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Application-level keepalive interval — sends a bare newline to keep the
+/// TCP connection from going idle long enough to trigger OS keepalive probes
+/// (which Android Doze often ignores, causing spurious disconnects).
+/// Bare newlines are silently skipped by all KDE Connect readers and never
+/// surfaced to users.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const TLS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_IDENTITY_PACKET_SIZE: usize = 8192;
+const MIN_DISCOVERY_CONNECTION_INTERVAL: Duration = Duration::from_millis(500);
+const IDENTITY_BURST_COUNT: usize = 2;
+const IDENTITY_BURST_DELAY: Duration = Duration::from_millis(250);
 
 pub const DEFAULT_LISTEN_PORT: u16 = 1716;
 pub const DEFAULT_LISTEN_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(
@@ -42,6 +61,52 @@ pub const BROADCAST_ADDR: SocketAddr =
 /// incorrectly wiping a newer live connection out of `writer_map`.
 static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Extra per-connection metadata stored outside TransportEvent so the enum
+/// stays compatible with upstream's shape (no `device_type`, `shutdown_tx`,
+/// `peer_certificate`, etc. in the event fields).  Core reads this map after
+/// consuming a `NewConnection` / `IncomingPacket` / … event.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnMetadata {
+    pub device_type: String,
+    pub incoming_capabilities: Vec<String>,
+    pub outgoing_capabilities: Vec<String>,
+    pub protocol_version: usize,
+    pub pairing_timestamp: u64,
+    pub peer_certificate: Vec<u8>,
+    pub shutdown_tx: watch::Sender<bool>,
+    /// conn_id of the *next* IncomingPacket (set by the reader task before
+    /// sending the event so the wildcard `IncomingPacket` arm in core can
+    /// look it up).
+    pub incoming_conn_id: u64,
+}
+
+pub(crate) static CONN_METADATA: Lazy<StdMutex<HashMap<DeviceId, ConnMetadata>>> =
+    Lazy::new(|| StdMutex::new(HashMap::new()));
+
+/// Pop and return the metadata for a device, if present.
+pub(crate) fn take_conn_metadata(id: &DeviceId) -> Option<ConnMetadata> {
+    CONN_METADATA.lock().ok()?.remove(id)
+}
+
+#[derive(Default)]
+pub(crate) struct ConnectionRateLimiter {
+    by_device: Mutex<HashMap<DeviceId, Instant>>,
+}
+
+impl ConnectionRateLimiter {
+    pub(crate) async fn allow_device_connection(&self, id: &DeviceId) -> bool {
+        let now = Instant::now();
+        let mut guard = self.by_device.lock().await;
+        if let Some(last_seen) = guard.get(id)
+            && now.duration_since(*last_seen) < MIN_DISCOVERY_CONNECTION_INTERVAL
+        {
+            return false;
+        }
+        guard.insert(id.clone(), now);
+        true
+    }
+}
+
 #[derive(Debug)]
 pub enum TransportEvent {
     IncomingPacket {
@@ -54,22 +119,30 @@ pub enum TransportEvent {
         id: DeviceId,
         name: String,
         write_tx: mpsc::UnboundedSender<ProtocolPacket>,
-        /// Unique ID for this connection instance.
         conn_id: u64,
     },
-    /// Emitted when the reader loop ends (peer closed / broken pipe).
-    /// `conn_id` must match the stored value for this device before core
-    /// removes the writer_map entry; a mismatch means a newer connection
-    /// has already replaced this one.
-    Disconnected { id: DeviceId, conn_id: u64 },
+    Disconnected {
+        id: DeviceId,
+        conn_id: u64,
+    },
+    /// Emitted when a paired device presents a mismatched TLS certificate.
+    PairTrustFailed {
+        id: DeviceId,
+    },
+    /// Emitted by the writer task when a packet could not be sent to the peer.
+    PacketSendFailed {
+        id: DeviceId,
+        packet_type: PacketType,
+        conn_id: u64,
+    },
 }
 
-/// Enable TCP keepalive so the OS detects a dead connection within ~60s
-/// (30s idle + 3 × 10s probes) rather than waiting indefinitely.
+/// Enable TCP keepalive so the OS detects a dead connection within ~25s
+/// (10s idle + 3 × 5s probes) rather than waiting indefinitely.
 fn apply_keepalive(stream: &TcpStream) {
     let keepalive = TcpKeepalive::new()
-        .with_time(Duration::from_secs(30))
-        .with_interval(Duration::from_secs(10))
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(5))
         .with_retries(3);
     let sock_ref = socket2::SockRef::from(stream);
     if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
@@ -77,26 +150,163 @@ fn apply_keepalive(stream: &TcpStream) {
     }
 }
 
+fn is_private_kdeconnect_addr(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(addr) => {
+            let octets = addr.octets();
+            let is_cgnat = octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000;
+            addr.is_private() || addr.is_link_local() || addr.is_loopback() || is_cgnat
+        }
+        IpAddr::V6(addr) => {
+            addr.is_unique_local() || addr.is_unicast_link_local() || addr.is_loopback()
+        }
+    }
+}
+
+async fn read_line_bounded<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_len: usize,
+) -> anyhow::Result<String> {
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte).await? {
+            0 => return Err(anyhow::anyhow!("EOF reading identity")),
+            1 => {
+                raw.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if raw.len() > max_len {
+                    return Err(anyhow::anyhow!("identity line too long"));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(String::from_utf8_lossy(&raw).into_owned())
+}
+
+fn validate_identity_target(
+    peer_identity: &Identity,
+    local_identity: &Identity,
+) -> anyhow::Result<()> {
+    if let Some(target_device_id) = peer_identity.target_device_id.as_deref()
+        && target_device_id != local_identity.device_id
+    {
+        return Err(anyhow::anyhow!(
+            "received connection request for different target device {}",
+            target_device_id
+        ));
+    }
+
+    if let Some(target_protocol_version) = peer_identity.target_protocol_version
+        && target_protocol_version != local_identity.protocol_version
+    {
+        return Err(anyhow::anyhow!(
+            "received connection request for protocol {}, local protocol is {}",
+            target_protocol_version,
+            local_identity.protocol_version
+        ));
+    }
+
+    Ok(())
+}
+
+fn targeted_identity(
+    base: &Identity,
+    target_device_id: &str,
+    target_protocol_version: usize,
+) -> Identity {
+    let mut identity = base.clone();
+    identity.target_device_id = Some(target_device_id.to_string());
+    identity.target_protocol_version = Some(target_protocol_version);
+    identity
+}
+
+async fn write_identity_packet<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    identity: &Identity,
+) -> anyhow::Result<()> {
+    let raw =
+        ProtocolPacket::new(PacketType::Identity, serde_json::to_value(identity)?).as_raw()?;
+    writer.write_all(&raw).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn exchange_secure_identity<S>(
+    stream: &mut S,
+    expected_device_id: &str,
+    expected_protocol_version: usize,
+    local_identity: &Identity,
+) -> anyhow::Result<Identity>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_identity_packet(stream, local_identity).await?;
+
+    let line = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_line_bounded(stream, MAX_IDENTITY_PACKET_SIZE),
+    )
+    .await??;
+    let packet = serde_json::from_str::<ProtocolPacket>(&line)?;
+    if !matches!(packet.packet_type, PacketType::Identity) {
+        return Err(anyhow::anyhow!(
+            "expected secure identity packet, received {:?}",
+            packet.packet_type
+        ));
+    }
+
+    let identity = serde_json::from_value::<Identity>(packet.body)?;
+    crate::device::validate_device_id(&identity.device_id)?;
+    if identity.device_id != expected_device_id {
+        return Err(anyhow::anyhow!(
+            "device ID changed during TLS handshake: {} -> {}",
+            expected_device_id,
+            identity.device_id
+        ));
+    }
+    if identity.protocol_version != expected_protocol_version {
+        return Err(anyhow::anyhow!(
+            "protocol version changed during TLS handshake: {} -> {}",
+            expected_protocol_version,
+            identity.protocol_version
+        ));
+    }
+
+    Ok(identity)
+}
+
 pub struct TcpTransport {
     listen_addr: SocketAddr,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     identity: Arc<Identity>,
+    client_config: Arc<rustls::ClientConfig>,
     server_config: Arc<rustls::ServerConfig>,
+    rate_limiter: Arc<ConnectionRateLimiter>,
 }
 
 impl TcpTransport {
-    pub fn new(event_tx: &mpsc::UnboundedSender<TransportEvent>) -> Self {
+    pub fn new(
+        event_tx: &mpsc::UnboundedSender<TransportEvent>,
+        rate_limiter: Arc<ConnectionRateLimiter>,
+    ) -> Self {
         let config = GLOBAL_CONFIG.get().unwrap();
         let listen_addr = config.listen_addr;
         let event_tx = event_tx.clone();
         let identity = Arc::new(config.identity.clone());
+        let client_config = config.key_store.client_config.clone();
         let server_config = config.key_store.server_config.clone();
 
         Self {
             listen_addr,
             event_tx,
             identity,
+            client_config,
             server_config,
+            rate_limiter,
         }
     }
 
@@ -114,158 +324,32 @@ impl TcpTransport {
         info!("TCP listener bound to {}", self.listen_addr);
 
         loop {
-            let event_tx = self.event_tx.clone();
-            let identity = self.identity.clone();
-
             match listener.accept().await {
-                Ok((mut stream, peer)) => {
+                Ok((stream, peer)) => {
                     info!(peer = ?peer, "[tcp] new connection");
                     apply_keepalive(&stream);
 
-                    // Step 1: read phone's pre-TLS identity.
-                    // Read byte-by-byte to avoid BufReader consuming TLS ClientHello
-                    // bytes into its internal buffer, which would cause "tls handshake eof".
-                    debug!(peer = ?peer, "[tcp] step 1: reading pre-TLS identity");
-                    let buffer = {
-                        let mut raw = Vec::new();
-                        let mut byte = [0u8; 1];
-                        loop {
-                            match stream.read(&mut byte).await {
-                                Ok(0) => {
-                                    warn!(peer = ?peer, "[tcp] EOF reading identity");
-                                    break;
-                                }
-                                Ok(_) => {
-                                    raw.push(byte[0]);
-                                    if byte[0] == b'\n' { break; }
-                                    if raw.len() > 65536 {
-                                        warn!(peer = ?peer, "[tcp] identity line too long");
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(peer = ?peer, "[tcp] failed to read identity line: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-                        String::from_utf8_lossy(&raw).into_owned()
-                    };
-                    debug!(peer = ?peer, "[tcp] step 1: read {} bytes", buffer.len());
+                    let event_tx = self.event_tx.clone();
+                    let identity = self.identity.clone();
+                    let client_config = self.client_config.clone();
+                    let server_config = self.server_config.clone();
+                    let rate_limiter = self.rate_limiter.clone();
 
-                    let identity = identity.clone();
-
-                    let packet = match serde_json::from_str::<ProtocolPacket>(&buffer) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!(peer = ?peer, "[tcp] failed to parse identity packet: {}", e);
-                            continue;
-                        }
-                    };
-                    let peer_identity = match serde_json::from_value::<Identity>(packet.body) {
-                        Ok(i) => i,
-                        Err(e) => {
-                            warn!(peer = ?peer, "[tcp] failed to parse identity body: {}", e);
-                            // Complete the TLS handshake gracefully so the phone doesn't see
-                            // an abrupt TCP drop and retry aggressively causing connection churn.
-                            match TlsAcceptor::from(self.server_config.clone())
-                                .accept(stream)
-                                .await
-                            {
-                                Ok(mut tls_stream) => {
-                                    let _ = tls_stream.shutdown().await;
-                                }
-                                Err(tls_e) => {
-                                    warn!(peer = ?peer, "[tcp] TLS cleanup after identity error failed: {}", tls_e);
-                                }
-                            }
-                            continue;
-                        }
-                    };
-
-                    let name = peer_identity.device_name.clone();
-                    let id = peer_identity.device_id.clone();
-                    info!(peer = ?peer, device_id = ?id, device_name = name, "[tcp] identified peer");
-
-                    if identity.device_id == peer_identity.device_id {
-                        warn!(peer = ?peer, device_id = ?id, "skipping the same device");
-                        continue;
-                    }
-
-                    // Step 2: send our identity back pre-TLS
-                    debug!(peer = ?peer, "[tcp] step 2: sending our pre-TLS identity");
-                    let our_identity = ProtocolPacket::new(
-                        PacketType::Identity,
-                        serde_json::to_value(&*self.identity).unwrap(),
-                    )
-                    .as_raw()
-                    .expect("Failed to serialize identity packet");
-                    if let Err(e) = stream.write_all(our_identity.as_slice()).await {
-                        warn!(peer = ?peer, "[tcp] failed to send pre-TLS identity: {}", e);
-                        continue;
-                    }
-                    let _ = stream.flush().await;
-                    debug!(peer = ?peer, "[tcp] step 2: pre-TLS identity sent");
-
-                    // Step 3: TLS handshake — we are the server (phone connected to us)
-                    debug!(peer = ?peer, "[tcp] step 3: starting TLS accept (we are server)");
-                    let mut tls_stream = match TlsAcceptor::from(self.server_config.clone())
-                        .accept(stream)
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_incoming_tcp(
+                            stream,
+                            peer,
+                            event_tx,
+                            identity,
+                            client_config,
+                            server_config,
+                            rate_limiter,
+                        )
                         .await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!(peer = ?peer, "[tcp] TLS accept failed: {}", e);
-                            continue;
+                        {
+                            warn!(peer = ?peer, "[tcp] connection handler failed: {}", e);
                         }
-                    };
-                    info!(peer = ?peer, device_id = ?id, "[tcp] step 3: TLS established");
-
-                    // Step 4: send our identity post-TLS for plugin negotiation.
-                    // Filter capabilities based on per-device disabled plugins so
-                    // the phone immediately knows which packet types to stop sending.
-                    debug!(peer = ?peer, "[tcp] step 4: sending post-TLS identity");
-                    let filtered = filtered_identity_for_device(&id).await;
-                    let post_tls_identity = ProtocolPacket::new(
-                        PacketType::Identity,
-                        serde_json::to_value(&filtered).unwrap(),
-                    )
-                    .as_raw()
-                    .expect("Failed to serialize identity packet");
-                    if let Err(e) = tls_stream.write_all(post_tls_identity.as_slice()).await {
-                        warn!(peer = ?peer, "[tcp] failed to send post-TLS identity: {}", e);
-                        continue;
-                    }
-                    let _ = tls_stream.flush().await;
-                    debug!(peer = ?peer, "[tcp] step 4: post-TLS identity sent");
-
-                    let (reader, writer) = split(tls_stream);
-
-                    let (write_tx, write_rx) = mpsc::unbounded_channel::<ProtocolPacket>();
-                    let write_rx = Arc::new(Mutex::new(write_rx));
-
-                    let conn_id = CONN_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-                    // Do NOT .await the spawn — blocks the accept loop until connection closes.
-                    tokio::spawn(handle_connection(
-                        event_tx.clone(),
-                        reader,
-                        writer,
-                        write_rx,
-                        peer,
-                        DeviceId(id.clone()),
-                        conn_id,
-                    ));
-
-                    if let Err(e) = event_tx.send(TransportEvent::NewConnection {
-                        addr: peer,
-                        id: DeviceId(peer_identity.device_id),
-                        name: name.clone(),
-                        write_tx,
-                        conn_id,
-                    }) {
-                        error!(peer = ?peer, "[tcp] transport event channel closed: {}", e);
-                    }
+                    });
                 }
                 Err(e) => {
                     warn!("[tcp] accept error: {}", e);
@@ -275,6 +359,172 @@ impl TcpTransport {
     }
 }
 
+async fn handle_incoming_tcp(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    event_tx: mpsc::UnboundedSender<TransportEvent>,
+    identity: Arc<Identity>,
+    client_config: Arc<rustls::ClientConfig>,
+    server_config: Arc<rustls::ServerConfig>,
+    rate_limiter: Arc<ConnectionRateLimiter>,
+) -> anyhow::Result<()> {
+    if !is_private_kdeconnect_addr(peer.ip()) {
+        return Err(anyhow::anyhow!(
+            "discarding TCP connection from non-local address {}",
+            peer.ip()
+        ));
+    }
+
+    // Step 1: read phone's pre-TLS identity.
+    // Read byte-by-byte to avoid BufReader consuming TLS ClientHello
+    // bytes into its internal buffer, which would cause "tls handshake eof".
+    debug!(peer = ?peer, "[tcp] step 1: reading pre-TLS identity");
+    let buffer = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_line_bounded(&mut stream, MAX_IDENTITY_PACKET_SIZE),
+    )
+    .await??;
+    debug!(peer = ?peer, "[tcp] step 1: read {} bytes", buffer.len());
+
+    let packet = serde_json::from_str::<ProtocolPacket>(&buffer)?;
+    if !matches!(packet.packet_type, PacketType::Identity) {
+        return Err(anyhow::anyhow!(
+            "expected pre-TLS identity packet, received {:?}",
+            packet.packet_type
+        ));
+    }
+    let mut peer_identity = match serde_json::from_value::<Identity>(packet.body) {
+        Ok(i) => i,
+        Err(e) => {
+            // Complete the TLS handshake gracefully so the phone doesn't see
+            // an abrupt TCP drop and retry aggressively causing connection churn.
+            tokio::spawn(async move {
+                if let Ok(mut tls_stream) = TlsAcceptor::from(server_config).accept(stream).await {
+                    let _ = tls_stream.shutdown().await;
+                }
+            });
+            return Err(e.into());
+        }
+    };
+    validate_identity_target(&peer_identity, &identity)?;
+
+    let name = peer_identity.device_name.clone();
+    let id = peer_identity.device_id.clone();
+    let peer_protocol_version = peer_identity.protocol_version;
+    info!(peer = ?peer, device_id = ?id, device_name = name, "[tcp] identified peer");
+
+    if identity.device_id == peer_identity.device_id {
+        return Err(anyhow::anyhow!("skipping the same device"));
+    }
+
+    // Validate device ID and sanitize name early, before TLS.
+    crate::device::validate_device_id(&id)?;
+    let device_id = DeviceId(id.clone());
+    if !rate_limiter.allow_device_connection(&device_id).await {
+        debug!(
+            peer = ?peer,
+            device_id = ?device_id,
+            "[tcp] duplicate connection attempt suppressed"
+        );
+        return Ok(());
+    }
+    let name = crate::device::sanitize_device_name(&name);
+
+    // Step 2: TLS handshake. KDE Connect's LAN protocol makes the
+    // side accepting the TCP connection act as the TLS client.
+    debug!(peer = ?peer, "[tcp] step 2: starting TLS connect (we are client)");
+    let server_name = ServerName::try_from(id.as_str())?.to_owned();
+    let mut tls_stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        TlsConnector::from(client_config).connect(server_name, stream),
+    )
+    .await??;
+
+    info!(peer = ?peer, device_id = ?id, "[tcp] step 2: TLS established");
+    let peer_certificate = peer_certificate_der(tls_stream.get_ref().1.peer_certificates());
+    if paired_certificate_mismatch(
+        &DeviceId(id.clone()),
+        &name,
+        peer_identity.device_type.to_string(),
+        peer_identity.incoming_capabilities.clone(),
+        peer_identity.outgoing_capabilities.clone(),
+        peer,
+        &peer_certificate,
+    )
+    .await
+    {
+        let _ = event_tx.send(TransportEvent::PairTrustFailed {
+            id: DeviceId(id.clone()),
+        });
+        let _ = tls_stream.shutdown().await;
+        return Err(anyhow::anyhow!(
+            "paired device presented a different TLS certificate"
+        ));
+    }
+
+    if peer_protocol_version >= 8 {
+        // Protocol v8 requires replacing the cleartext identity with the
+        // identity exchanged inside TLS before trusting capabilities.
+        debug!(peer = ?peer, "[tcp] step 3: exchanging secure identity");
+        let filtered = filtered_identity_for_device(&id).await;
+        peer_identity =
+            exchange_secure_identity(&mut tls_stream, &id, peer_protocol_version, &filtered)
+                .await?;
+        debug!(peer = ?peer, "[tcp] step 3: secure identity exchanged");
+    }
+
+    let name = crate::device::sanitize_device_name(&peer_identity.device_name);
+
+    let (reader, writer) = split(tls_stream);
+
+    let (write_tx, write_rx) = mpsc::unbounded_channel::<ProtocolPacket>();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let conn_id = CONN_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    {
+        let mut meta = CONN_METADATA.lock().expect("CONN_METADATA poisoned");
+        meta.insert(
+            DeviceId(peer_identity.device_id.clone()),
+            ConnMetadata {
+                device_type: peer_identity.device_type.to_string(),
+                incoming_capabilities: peer_identity.incoming_capabilities,
+                outgoing_capabilities: peer_identity.outgoing_capabilities,
+                protocol_version: peer_identity.protocol_version,
+                pairing_timestamp: 0,
+                peer_certificate,
+                shutdown_tx: shutdown_tx.clone(),
+                incoming_conn_id: 0,
+            },
+        );
+    }
+
+    if let Err(e) = event_tx.send(TransportEvent::NewConnection {
+        addr: peer,
+        id: DeviceId(peer_identity.device_id),
+        name: name.clone(),
+        write_tx,
+        conn_id,
+    }) {
+        return Err(anyhow::anyhow!("transport event channel closed: {}", e));
+    }
+
+    tokio::spawn(handle_connection(
+        reader,
+        writer,
+        ConnectionContext {
+            event_tx: event_tx.clone(),
+            write_rx,
+            peer,
+            id: DeviceId(id.clone()),
+            conn_id,
+            shutdown_rx,
+        },
+    ));
+
+    Ok(())
+}
+
 pub struct UdpTransport {
     socket: Arc<UdpSocket>,
     discovery_interval: Duration,
@@ -282,10 +532,15 @@ pub struct UdpTransport {
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     identity: Arc<Identity>,
     server_config: Arc<rustls::ServerConfig>,
+    broadcast_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    rate_limiter: Arc<ConnectionRateLimiter>,
 }
 
 impl UdpTransport {
-    pub async fn new(event_tx: &mpsc::UnboundedSender<TransportEvent>) -> Self {
+    pub async fn new(
+        event_tx: &mpsc::UnboundedSender<TransportEvent>,
+        rate_limiter: Arc<ConnectionRateLimiter>,
+    ) -> Self {
         let config = GLOBAL_CONFIG.get().unwrap();
 
         let socket = {
@@ -302,11 +557,17 @@ impl UdpTransport {
                             tracing::error!(
                                 "UDP port {} still in use after {} attempts — \
                                  another instance may be running, exiting: {}",
-                                config.listen_addr.port(), attempts, e
+                                config.listen_addr.port(),
+                                attempts,
+                                e
                             );
                             std::process::exit(1);
                         }
-                        tracing::warn!("UDP bind failed (attempt {}), retrying in 1s: {}", attempts, e);
+                        tracing::warn!(
+                            "UDP bind failed (attempt {}), retrying in 1s: {}",
+                            attempts,
+                            e
+                        );
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                 }
@@ -326,6 +587,8 @@ impl UdpTransport {
             event_tx,
             identity,
             server_config,
+            broadcast_handle: Arc::new(Mutex::new(None)),
+            rate_limiter,
         }
     }
 
@@ -333,6 +596,15 @@ impl UdpTransport {
         if std::env::var("KDECONNECT_DISABLE_UDP_BROADCAST").is_ok() {
             warn!("UDP broadcast disabled by environment variable");
             return Ok(());
+        }
+
+        // Cancel any previously-spawned broadcast task so we never accumulate
+        // orphaned broadcast loops.
+        {
+            let mut guard = self.broadcast_handle.lock().await;
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
         }
 
         debug!("Broadcasting UDP identity packet");
@@ -346,35 +618,53 @@ impl UdpTransport {
         .as_raw()
         .expect("Failed to serialize identity packet");
 
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let mut interval = tokio::time::interval(Duration::from_secs(interval.as_secs()));
-            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-            loop {
+        let handle = tokio::spawn(async move {
+            // Send a short burst immediately for explicit scans. UDP broadcast is
+            // intentionally lossy on many Wi-Fi networks, so a single packet can
+            // be missed even when discovery should work.
+            for _ in 0..IDENTITY_BURST_COUNT {
                 match udp_socket.send_to(packet.as_slice(), BROADCAST_ADDR).await {
                     Ok(size) => {
                         debug!(addr = ?BROADCAST_ADDR, packet.size = size, "Sending udp broadcast")
                     }
                     Err(e) => warn!(addr = ?BROADCAST_ADDR, "Failed to send UDP packet: {}", e),
                 }
+                tokio::time::sleep(IDENTITY_BURST_DELAY).await;
+            }
+
+            let mut interval = tokio::time::interval(Duration::from_secs(interval.as_secs()));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
                 interval.tick().await;
+                match udp_socket.send_to(packet.as_slice(), BROADCAST_ADDR).await {
+                    Ok(size) => {
+                        debug!(addr = ?BROADCAST_ADDR, packet.size = size, "Sending udp broadcast")
+                    }
+                    Err(e) => warn!(addr = ?BROADCAST_ADDR, "Failed to send UDP packet: {}", e),
+                }
             }
         });
+
+        *self.broadcast_handle.lock().await = Some(handle);
 
         Ok(())
     }
 
     pub async fn listen(&self) -> anyhow::Result<()> {
-        let event_tx = self.event_tx.clone();
-        let this_identity = self.identity.clone();
+        let mut buf = vec![0u8; MAX_IDENTITY_PACKET_SIZE];
 
         loop {
-            let this_identity = this_identity.clone();
-            let mut buf = vec![0u8; 8192];
-
             match self.socket.recv_from(&mut buf).await {
-                Ok((len, mut peer)) => {
+                Ok((len, peer)) => {
+                    if !is_private_kdeconnect_addr(peer.ip()) {
+                        debug!(
+                            peer = ?peer,
+                            "[udp] discarding identity from non-local address"
+                        );
+                        continue;
+                    }
+
                     let raw = &buf[..len];
                     let packet = match ProtocolPacket::from_raw(raw) {
                         Ok(p) => p,
@@ -383,97 +673,45 @@ impl UdpTransport {
                             continue;
                         }
                     };
+                    if !matches!(packet.packet_type, PacketType::Identity) {
+                        debug!(
+                            "[udp] ignoring non-identity packet {:?}",
+                            packet.packet_type
+                        );
+                        continue;
+                    }
 
-                    if let Ok(peer_identity) = serde_json::from_value::<Identity>(packet.body) {
-                        if this_identity.device_id == peer_identity.device_id {
-                            warn!("[udp] skipping the same device");
+                    let peer_identity = match serde_json::from_value::<Identity>(packet.body) {
+                        Ok(i) => i,
+                        Err(e) => {
+                            warn!("[udp] failed to parse identity body: {}", e);
                             continue;
                         }
+                    };
 
-                        let id = DeviceId(peer_identity.device_id.clone());
-                        let name = peer_identity.device_name.clone();
-
-                        if let Some(new_port) = peer_identity.tcp_port {
-                            peer.set_port(new_port);
-                            info!(peer = ?peer, device_id = ?id, device_name = name, "Device supports TCP");
-                        }
-
-                        let mut stream = match TcpStream::connect(peer).await {
-                            Ok(s) => {
-                                apply_keepalive(&s);
-                                s
-                            }
-                            Err(e) => {
-                                warn!(peer = ?peer, "[udp] TCP connect failed: {}", e);
-                                continue;
-                            }
-                        };
-
-                        // Send identity pre-TLS — phone reads this before initiating TLS.
-                        let pre_tls_identity = ProtocolPacket::new(
-                            PacketType::Identity,
-                            serde_json::to_value(&*self.identity).unwrap(),
-                        )
-                        .as_raw()
-                        .expect("Failed to serialize identity packet");
-
-                        let _ = stream.write_all(pre_tls_identity.as_slice()).await;
-                        let _ = stream.flush().await;
-
-                        let acceptor = TlsAcceptor::from(self.server_config.clone());
-
-                        let mut tls_stream = match acceptor.accept(stream).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                warn!(peer = ?peer, "[udp] TLS handshake failed: {}", e);
-                                continue;
-                            }
-                        };
-
-                        info!(peer = ?peer, device_id = ?id, device_name = name, "[udp] Established TLS connection");
-
-                        // Send identity post-TLS — phone uses this for plugin negotiation.
-                        // Filter capabilities based on per-device disabled plugins so
-                        // the phone immediately knows which packet types to stop sending.
-                        let filtered = filtered_identity_for_device(&id.0).await;
-                        let post_tls_identity = ProtocolPacket::new(
-                            PacketType::Identity,
-                            serde_json::to_value(&filtered).unwrap(),
-                        )
-                        .as_raw()
-                        .expect("Failed to serialize identity packet");
-
-                        let _ = tls_stream.write_all(post_tls_identity.as_slice()).await;
-                        let _ = tls_stream.flush().await;
-
-                        let (reader, writer) = split(tls_stream);
-
-                        let (write_tx, write_rx) = mpsc::unbounded_channel::<ProtocolPacket>();
-                        let write_rx = Arc::new(Mutex::new(write_rx));
-
-                        let conn_id = CONN_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-                        // Do NOT .await the spawn — blocks the UDP listen loop.
-                        tokio::spawn(handle_connection(
-                            event_tx.clone(),
-                            reader,
-                            writer,
-                            write_rx,
-                            peer,
-                            id.clone(),
-                            conn_id,
-                        ));
-
-                        if let Err(e) = event_tx.send(TransportEvent::NewConnection {
-                            addr: peer,
-                            id: DeviceId(peer_identity.device_id),
-                            name: name.clone(),
-                            write_tx,
-                            conn_id,
-                        }) {
-                            error!(peer = ?peer, device_id = ?id, "[udp] transport event channel closed: {}", e);
-                        }
+                    if self.identity.device_id == peer_identity.device_id {
+                        continue;
                     }
+
+                    let event_tx = self.event_tx.clone();
+                    let this_identity = self.identity.clone();
+                    let server_config = self.server_config.clone();
+                    let rate_limiter = self.rate_limiter.clone();
+
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_discovered_device(
+                            peer,
+                            peer_identity,
+                            event_tx,
+                            this_identity,
+                            server_config,
+                            rate_limiter,
+                        )
+                        .await
+                        {
+                            warn!(peer = ?peer, "[udp] failed to handle discovery: {}", e);
+                        }
+                    });
                 }
                 Err(e) => {
                     warn!("[udp] recv_from error: {}", e);
@@ -483,29 +721,272 @@ impl UdpTransport {
     }
 }
 
-async fn handle_connection<R, W>(
+async fn handle_discovered_device(
+    mut peer: SocketAddr,
+    mut peer_identity: Identity,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
-    reader: R,
-    mut writer: W,
-    write_rx: Arc<Mutex<mpsc::UnboundedReceiver<ProtocolPacket>>>,
+    this_identity: Arc<Identity>,
+    server_config: Arc<rustls::ServerConfig>,
+    rate_limiter: Arc<ConnectionRateLimiter>,
+) -> anyhow::Result<()> {
+    if !is_private_kdeconnect_addr(peer.ip()) {
+        return Err(anyhow::anyhow!(
+            "discarding UDP discovery from non-local address {}",
+            peer.ip()
+        ));
+    }
+
+    let id = DeviceId(peer_identity.device_id.clone());
+    let name = peer_identity.device_name.clone();
+    let peer_protocol_version = peer_identity.protocol_version;
+
+    // Validate device ID and sanitize name early.
+    crate::device::validate_device_id(&id.0)?;
+    if !rate_limiter.allow_device_connection(&id).await {
+        debug!(
+            peer = ?peer,
+            device_id = ?id,
+            "[udp] duplicate discovery connection suppressed"
+        );
+        return Ok(());
+    }
+    let name = crate::device::sanitize_device_name(&name);
+
+    if let Some(new_port) = peer_identity.tcp_port {
+        peer.set_port(new_port);
+        info!(peer = ?peer, device_id = ?id, device_name = name, "Device supports TCP");
+    }
+
+    let mut stream =
+        tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(peer)).await??;
+    apply_keepalive(&stream);
+
+    // Send identity pre-TLS — phone reads this before initiating TLS.
+    let pre_tls_identity = targeted_identity(&this_identity, &id.0, peer_protocol_version);
+    let pre_tls_identity = ProtocolPacket::new(
+        PacketType::Identity,
+        serde_json::to_value(&pre_tls_identity)?,
+    )
+    .as_raw()?;
+    stream.write_all(pre_tls_identity.as_slice()).await?;
+    stream.flush().await?;
+
+    let acceptor = TlsAcceptor::from(server_config);
+
+    let mut tls_stream =
+        tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await??;
+
+    info!(peer = ?peer, device_id = ?id, device_name = name, "[udp] Established TLS connection");
+    let peer_certificate = peer_certificate_der(tls_stream.get_ref().1.peer_certificates());
+    if paired_certificate_mismatch(
+        &id,
+        &name,
+        peer_identity.device_type.to_string(),
+        peer_identity.incoming_capabilities.clone(),
+        peer_identity.outgoing_capabilities.clone(),
+        peer,
+        &peer_certificate,
+    )
+    .await
+    {
+        let _ = event_tx.send(TransportEvent::PairTrustFailed { id });
+        let _ = tls_stream.shutdown().await;
+        return Err(anyhow::anyhow!(
+            "paired device presented a different TLS certificate"
+        ));
+    }
+
+    if peer_protocol_version >= 8 {
+        let filtered = filtered_identity_for_device(&id.0).await;
+        peer_identity =
+            exchange_secure_identity(&mut tls_stream, &id.0, peer_protocol_version, &filtered)
+                .await?;
+    }
+
+    let name = crate::device::sanitize_device_name(&peer_identity.device_name);
+
+    let (reader, writer) = split(tls_stream);
+
+    let (write_tx, write_rx) = mpsc::unbounded_channel::<ProtocolPacket>();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let conn_id = CONN_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    {
+        let mut meta = CONN_METADATA.lock().expect("CONN_METADATA poisoned");
+        meta.insert(
+            DeviceId(peer_identity.device_id.clone()),
+            ConnMetadata {
+                device_type: peer_identity.device_type.to_string(),
+                incoming_capabilities: peer_identity.incoming_capabilities,
+                outgoing_capabilities: peer_identity.outgoing_capabilities,
+                protocol_version: peer_identity.protocol_version,
+                pairing_timestamp: 0,
+                peer_certificate,
+                shutdown_tx: shutdown_tx.clone(),
+                incoming_conn_id: 0,
+            },
+        );
+    }
+
+    if let Err(e) = event_tx.send(TransportEvent::NewConnection {
+        addr: peer,
+        id: DeviceId(peer_identity.device_id),
+        name: name.clone(),
+        write_tx,
+        conn_id,
+    }) {
+        return Err(anyhow::anyhow!("transport event channel closed: {}", e));
+    }
+
+    tokio::spawn(handle_connection(
+        reader,
+        writer,
+        ConnectionContext {
+            event_tx: event_tx.clone(),
+            write_rx,
+            peer,
+            id: id.clone(),
+            conn_id,
+            shutdown_rx,
+        },
+    ));
+
+    Ok(())
+}
+
+fn peer_certificate_der(certs: Option<&[rustls::pki_types::CertificateDer<'static>]>) -> Vec<u8> {
+    certs
+        .and_then(|certs| certs.first())
+        .map(|cert| cert.as_ref().to_vec())
+        .unwrap_or_default()
+}
+
+async fn paired_certificate_mismatch(
+    id: &DeviceId,
+    name: &str,
+    device_type: String,
+    incoming_capabilities: Vec<String>,
+    outgoing_capabilities: Vec<String>,
+    addr: SocketAddr,
+    peer_certificate: &[u8],
+) -> bool {
+    if peer_certificate.is_empty() {
+        return false;
+    }
+
+    let Ok(device) = Device::from_discovery(
+        id.0.clone(),
+        name.to_string(),
+        device_type,
+        incoming_capabilities,
+        outgoing_capabilities,
+        addr,
+    )
+    .await
+    else {
+        return false;
+    };
+
+    let mismatch = device.pair_state == PairState::Paired
+        && !device.remote_certificate.is_empty()
+        && device.remote_certificate != peer_certificate;
+
+    if mismatch {
+        let _ = device.update_pair_state(PairState::NotPaired).await;
+    }
+
+    mismatch
+}
+
+struct ConnectionContext {
+    event_tx: mpsc::UnboundedSender<TransportEvent>,
+    write_rx: mpsc::UnboundedReceiver<ProtocolPacket>,
     peer: SocketAddr,
     id: DeviceId,
     conn_id: u64,
-) where
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+enum InterruptibleIo {
+    Completed(std::io::Result<()>),
+    Interrupted,
+}
+
+async fn write_all_interruptible<W>(
+    writer: &mut W,
+    bytes: &[u8],
+    shutdown_rx: &mut watch::Receiver<bool>,
+    local_close_rx: &mut watch::Receiver<bool>,
+) -> InterruptibleIo
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown_rx.changed() => InterruptibleIo::Interrupted,
+        _ = local_close_rx.changed() => InterruptibleIo::Interrupted,
+        result = writer.write_all(bytes) => InterruptibleIo::Completed(result),
+    }
+}
+
+async fn flush_interruptible<W>(
+    writer: &mut W,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    local_close_rx: &mut watch::Receiver<bool>,
+) -> InterruptibleIo
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown_rx.changed() => InterruptibleIo::Interrupted,
+        _ = local_close_rx.changed() => InterruptibleIo::Interrupted,
+        result = writer.flush() => InterruptibleIo::Completed(result),
+    }
+}
+
+async fn handle_connection<R, W>(reader: R, mut writer: W, context: ConnectionContext)
+where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let ConnectionContext {
+        event_tx,
+        mut write_rx,
+        peer,
+        id,
+        conn_id,
+        shutdown_rx,
+    } = context;
     let mut reader = BufReader::new(reader);
     let mut buffer = String::new();
+    let (local_close_tx, local_close_rx) = watch::channel(false);
 
     // Reader task — forwards packets and emits Disconnected when the connection ends.
     let event_tx_reader = event_tx.clone();
     let id_reader = id.clone();
+    let mut shutdown_rx_reader = shutdown_rx.clone();
+    let mut local_close_rx_reader = local_close_rx.clone();
+    let local_close_tx_reader = local_close_tx.clone();
     tokio::spawn(async move {
         loop {
-            match reader.read_line(&mut buffer).await {
+            let read_result = tokio::select! {
+                biased;
+                _ = shutdown_rx_reader.changed() => {
+                    debug!(peer = ?peer, "[reader loop] shutting down superseded connection");
+                    break;
+                }
+                _ = local_close_rx_reader.changed() => {
+                    debug!(peer = ?peer, "[reader loop] writer ended connection");
+                    break;
+                }
+                result = reader.read_line(&mut buffer) => result,
+            };
+
+            match read_result {
                 Ok(0) => {
-                    warn!(peer = ?peer, "[reader loop] connection closed");
+                    debug!(peer = ?peer, "[reader loop] connection closed");
                     break;
                 }
                 Ok(_) => {
@@ -519,6 +1000,26 @@ async fn handle_connection<R, W>(
                     // sensitive data eg. from sms
                     // eprintln!("[reader] raw bytes from {}: {:?}", peer, trimmed);
 
+                    if let Ok(mut meta) = CONN_METADATA.lock() {
+                        if let Some(data) = meta.get_mut(&id_reader) {
+                            data.incoming_conn_id = conn_id;
+                        } else {
+                            meta.insert(
+                                id_reader.clone(),
+                                ConnMetadata {
+                                    device_type: String::new(),
+                                    incoming_capabilities: vec![],
+                                    outgoing_capabilities: vec![],
+                                    protocol_version: 0,
+                                    pairing_timestamp: 0,
+                                    peer_certificate: vec![],
+                                    shutdown_tx: watch::channel(false).0,
+                                    incoming_conn_id: conn_id,
+                                },
+                            );
+                        }
+                    }
+
                     if let Err(e) = event_tx_reader.send(TransportEvent::IncomingPacket {
                         addr: peer,
                         id: id_reader.clone(),
@@ -529,13 +1030,23 @@ async fn handle_connection<R, W>(
                     }
                 }
                 Err(e) => {
-                    error!(peer = ?peer, "[reader loop] error reading: {}", e);
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::BrokenPipe
+                    ) {
+                        debug!(peer = ?peer, "[reader loop] connection ended: {}", e);
+                    } else {
+                        error!(peer = ?peer, "[reader loop] error reading: {}", e);
+                    }
                     break;
                 }
             }
             buffer.clear();
         }
-        warn!(peer = ?peer, "reader loop ended");
+        debug!(peer = ?peer, "reader loop ended");
+        let _ = local_close_tx_reader.send(true);
         // Notify core the connection is dead. conn_id lets core distinguish this
         // disconnect from a stale event belonging to a previous connection.
         let _ = event_tx_reader.send(TransportEvent::Disconnected {
@@ -544,21 +1055,142 @@ async fn handle_connection<R, W>(
         });
     });
 
-    // Writer task — drains the write channel and sends packets to the peer.
+    // Writer task — drains the write channel and sends periodic bare-newline
+    // keepalives to prevent the TCP connection from going idle.
+    let event_tx_writer = event_tx.clone();
+    let id_writer = id.clone();
+    let mut shutdown_rx_writer = shutdown_rx;
+    let mut local_close_rx_writer = local_close_rx;
+    let local_close_tx_writer = local_close_tx;
     tokio::spawn(async move {
-        while let Some(msg) = write_rx.lock().await.recv().await {
-            debug!(peer = ?peer, packet_type = ?msg.packet_type, "writing");
+        let mut close_gracefully = true;
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = shutdown_rx_writer.changed() => {
+                    debug!(peer = ?peer, "writer shutting down superseded connection");
+                    close_gracefully = false;
+                    break;
+                }
+                _ = local_close_rx_writer.changed() => {
+                    debug!(peer = ?peer, "writer shutting down because reader ended");
+                    close_gracefully = false;
+                    break;
+                }
+                msg = write_rx.recv() => msg,
+                _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
+                    match write_all_interruptible(
+                        &mut writer,
+                        b"\n",
+                        &mut shutdown_rx_writer,
+                        &mut local_close_rx_writer,
+                    )
+                    .await
+                    {
+                        InterruptibleIo::Completed(Ok(())) => {}
+                        InterruptibleIo::Completed(Err(e)) => {
+                            error!(peer = ?peer, "Error writing heartbeat: {}", e);
+                            close_gracefully = false;
+                            break;
+                        }
+                        InterruptibleIo::Interrupted => {
+                            close_gracefully = false;
+                            break;
+                        }
+                    }
+                    match flush_interruptible(
+                        &mut writer,
+                        &mut shutdown_rx_writer,
+                        &mut local_close_rx_writer,
+                    )
+                    .await
+                    {
+                        InterruptibleIo::Completed(Ok(())) => {}
+                        InterruptibleIo::Completed(Err(e)) => {
+                            error!(peer = ?peer, "Error flushing heartbeat: {}", e);
+                            close_gracefully = false;
+                            break;
+                        }
+                        InterruptibleIo::Interrupted => {
+                            close_gracefully = false;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            };
+            match msg {
+                Some(msg) => {
+                    debug!(peer = ?peer, packet_type = ?msg.packet_type, "writing");
+                    let packet_type = msg.packet_type.clone();
 
-            if let Err(e) = writer.write_all(&msg.as_raw().unwrap()).await {
-                error!(peer = ?peer, "Error writing: {}", e);
-                break;
-            }
-            if let Err(e) = writer.flush().await {
-                error!(peer = ?peer, "Error flushing: {}", e);
-                break;
+                    let raw = match msg.as_raw() {
+                        Ok(raw) => raw,
+                        Err(e) => {
+                            error!(peer = ?peer, "Error serializing packet: {}", e);
+                            continue;
+                        }
+                    };
+
+                    match write_all_interruptible(
+                        &mut writer,
+                        &raw,
+                        &mut shutdown_rx_writer,
+                        &mut local_close_rx_writer,
+                    )
+                    .await
+                    {
+                        InterruptibleIo::Completed(Ok(())) => {}
+                        InterruptibleIo::Completed(Err(e)) => {
+                            error!(peer = ?peer, "Error writing: {}", e);
+                            close_gracefully = false;
+                            let _ = event_tx_writer.send(TransportEvent::PacketSendFailed {
+                                id: id_writer.clone(),
+                                packet_type,
+                                conn_id,
+                            });
+                            break;
+                        }
+                        InterruptibleIo::Interrupted => {
+                            close_gracefully = false;
+                            break;
+                        }
+                    }
+                    match flush_interruptible(
+                        &mut writer,
+                        &mut shutdown_rx_writer,
+                        &mut local_close_rx_writer,
+                    )
+                    .await
+                    {
+                        InterruptibleIo::Completed(Ok(())) => {}
+                        InterruptibleIo::Completed(Err(e)) => {
+                            error!(peer = ?peer, "Error flushing: {}", e);
+                            close_gracefully = false;
+                            let _ = event_tx_writer.send(TransportEvent::PacketSendFailed {
+                                id: id_writer.clone(),
+                                packet_type,
+                                conn_id,
+                            });
+                            break;
+                        }
+                        InterruptibleIo::Interrupted => {
+                            close_gracefully = false;
+                            break;
+                        }
+                    }
+                }
+                None => break,
             }
         }
-        let _ = writer.shutdown().await;
+        if close_gracefully {
+            let _ = tokio::time::timeout(TLS_SHUTDOWN_TIMEOUT, writer.shutdown()).await;
+        }
+        let _ = local_close_tx_writer.send(true);
+        let _ = event_tx_writer.send(TransportEvent::Disconnected {
+            id: id_writer,
+            conn_id,
+        });
         info!(peer = ?peer, "writer task ended");
     });
 }
@@ -577,23 +1209,102 @@ async fn filtered_identity_for_device(device_id: &str) -> Identity {
     // Map plugin IDs to the capability strings they own.
     // (incoming_caps, outgoing_caps)
     let cap_map: &[(&str, &[&str], &[&str])] = &[
-        ("battery",             &["kdeconnect.battery"],                                                    &["kdeconnect.battery.request"]),
-        ("clipboard",           &["kdeconnect.clipboard", "kdeconnect.clipboard.connect"],                  &["kdeconnect.clipboard"]),
-        ("connectivity_report", &["kdeconnect.connectivity_report"],                                        &[]),
-        ("contacts",            &["kdeconnect.contacts.response_uids_timestamps",
-                                   "kdeconnect.contacts.response_vcards"],                                  &["kdeconnect.contacts.request_all_uids_timestamps",
-                                                                                                              "kdeconnect.contacts.request_vcards_by_uid"]),
-        ("findmyphone",         &[],                                                                        &["kdeconnect.findmyphone.request"]),
-        ("mpris",               &["kdeconnect.mpris", "kdeconnect.mpris.request"],                          &["kdeconnect.mpris", "kdeconnect.mpris.request"]),
-        ("notification",        &["kdeconnect.notification"],                                               &["kdeconnect.notification.request"]),
-        ("ping",                &["kdeconnect.ping"],                                                       &["kdeconnect.ping"]),
-        ("runcommand",          &["kdeconnect.runcommand.request"],                                         &["kdeconnect.runcommand"]),
-        ("share",               &["kdeconnect.share.request"],                                              &["kdeconnect.share.request", "kdeconnect.share.request.update"]),
-        ("sms",                 &["kdeconnect.sms.messages", "kdeconnect.sms.attachment_file"],             &["kdeconnect.sms.request",
-                                                                                                              "kdeconnect.sms.request_conversations",
-                                                                                                              "kdeconnect.sms.request_conversation",
-                                                                                                              "kdeconnect.sms.request_attachment"]),
-        ("telephony",           &["kdeconnect.telephony"],                                                  &["kdeconnect.telephony.request_mute"]),                                                                                                      
+        (
+            "battery",
+            &["kdeconnect.battery", "kdeconnect.battery.request"],
+            &["kdeconnect.battery", "kdeconnect.battery.request"],
+        ),
+        (
+            "clipboard",
+            &["kdeconnect.clipboard", "kdeconnect.clipboard.connect"],
+            &["kdeconnect.clipboard", "kdeconnect.clipboard.connect"],
+        ),
+        (
+            "connectivity_report",
+            &["kdeconnect.connectivity_report"],
+            &["kdeconnect.connectivity_report.request"],
+        ),
+        (
+            "contacts",
+            &[
+                "kdeconnect.contacts.response_uids_timestamps",
+                "kdeconnect.contacts.response_vcards",
+            ],
+            &[
+                "kdeconnect.contacts.request_all_uids_timestamps",
+                "kdeconnect.contacts.request_vcards_by_uid",
+            ],
+        ),
+        (
+            "findmyphone",
+            &["kdeconnect.findmyphone.request"],
+            &["kdeconnect.findmyphone.request"],
+        ),
+        (
+            "mousepad",
+            &[
+                "kdeconnect.mousepad.echo",
+                "kdeconnect.mousepad.keyboardstate",
+                "kdeconnect.mousepad.request",
+            ],
+            &[
+                "kdeconnect.mousepad.echo",
+                "kdeconnect.mousepad.keyboardstate",
+                "kdeconnect.mousepad.request",
+            ],
+        ),
+        (
+            "mpris",
+            &["kdeconnect.mpris", "kdeconnect.mpris.request"],
+            &["kdeconnect.mpris", "kdeconnect.mpris.request"],
+        ),
+        (
+            "notification",
+            &["kdeconnect.notification", "kdeconnect.notification.request"],
+            &[
+                "kdeconnect.notification",
+                "kdeconnect.notification.action",
+                "kdeconnect.notification.reply",
+                "kdeconnect.notification.request",
+            ],
+        ),
+        ("ping", &["kdeconnect.ping"], &["kdeconnect.ping"]),
+        ("presenter", &["kdeconnect.presenter"], &[]),
+        (
+            "runcommand",
+            &["kdeconnect.runcommand", "kdeconnect.runcommand.request"],
+            &["kdeconnect.runcommand", "kdeconnect.runcommand.request"],
+        ),
+        (
+            "share",
+            &["kdeconnect.share.request"],
+            &["kdeconnect.share.request"],
+        ),
+        (
+            "digitizer",
+            &["kdeconnect.digitizer", "kdeconnect.digitizer.session"],
+            &[],
+        ),
+        ("sftp", &["kdeconnect.sftp"], &["kdeconnect.sftp.request"]),
+        (
+            "sms",
+            &["kdeconnect.sms.messages"],
+            &[
+                "kdeconnect.sms.request",
+                "kdeconnect.sms.request_conversations",
+                "kdeconnect.sms.request_conversation",
+            ],
+        ),
+        (
+            "systemvolume",
+            &["kdeconnect.systemvolume.request"],
+            &["kdeconnect.systemvolume"],
+        ),
+        (
+            "telephony",
+            &["kdeconnect.telephony"],
+            &["kdeconnect.telephony.request_mute"],
+        ),
     ];
 
     let mut remove_inc: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -613,11 +1324,15 @@ async fn filtered_identity_for_device(device_id: &str) -> Identity {
         tcp_port: base.tcp_port,
         target_device_id: None,
         target_protocol_version: None,
-        incoming_capabilities: base.incoming_capabilities.iter()
+        incoming_capabilities: base
+            .incoming_capabilities
+            .iter()
             .filter(|c| !remove_inc.contains(c.as_str()))
             .cloned()
             .collect(),
-        outgoing_capabilities: base.outgoing_capabilities.iter()
+        outgoing_capabilities: base
+            .outgoing_capabilities
+            .iter()
             .filter(|c| !remove_out.contains(c.as_str()))
             .cloned()
             .collect(),
@@ -654,13 +1369,220 @@ pub(crate) async fn receive_payload(
 
     debug!("connected");
 
-    if let Ok(mut save_path) = tokio::fs::File::create(&temp_file).await {
-        let _ = tokio::io::copy(&mut stream, &mut save_path).await;
-        let _ = stream.flush().await;
-        let _ = stream.shutdown().await;
+    if let Some(parent) = temp_file.parent() {
+        tokio::fs::create_dir_all(parent).await?;
     }
+
+    let mut save_path = tokio::fs::File::create(temp_file).await?;
+    tokio::io::copy(&mut stream, &mut save_path).await?;
+    save_path.flush().await?;
+    stream.shutdown().await?;
 
     info!("successfully received payload");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ConnectionContext, ConnectionRateLimiter, TransportEvent, handle_connection,
+        is_private_kdeconnect_addr,
+    };
+    use crate::{
+        device::DeviceId,
+        protocol::{PacketType, ProtocolPacket},
+    };
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex, split},
+        sync::{mpsc, watch},
+        time::{Duration, timeout},
+    };
+
+    async fn start_test_connection_with_capacity(
+        conn_id: u64,
+        capacity: usize,
+    ) -> (
+        mpsc::UnboundedSender<ProtocolPacket>,
+        mpsc::UnboundedReceiver<TransportEvent>,
+        watch::Sender<bool>,
+        DuplexStream,
+        DeviceId,
+    ) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (local, remote) = duplex(capacity);
+        let (reader, writer) = split(local);
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let id = DeviceId(format!("transport-regression-{conn_id}"));
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1716));
+
+        handle_connection(
+            reader,
+            writer,
+            ConnectionContext {
+                event_tx,
+                write_rx,
+                peer,
+                id: id.clone(),
+                conn_id,
+                shutdown_rx,
+            },
+        )
+        .await;
+
+        (write_tx, event_rx, shutdown_tx, remote, id)
+    }
+
+    async fn start_test_connection(
+        conn_id: u64,
+    ) -> (
+        mpsc::UnboundedSender<ProtocolPacket>,
+        mpsc::UnboundedReceiver<TransportEvent>,
+        watch::Sender<bool>,
+        DuplexStream,
+        DeviceId,
+    ) {
+        start_test_connection_with_capacity(conn_id, 4096).await
+    }
+
+    async fn wait_for_disconnect(
+        event_rx: &mut mpsc::UnboundedReceiver<TransportEvent>,
+        id: &DeviceId,
+        conn_id: u64,
+    ) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match event_rx
+                    .recv()
+                    .await
+                    .expect("transport event channel closed")
+                {
+                    TransportEvent::Disconnected {
+                        id: disconnected_id,
+                        conn_id: disconnected_conn_id,
+                    } if &disconnected_id == id && disconnected_conn_id == conn_id => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("connection did not report disconnect");
+    }
+
+    async fn wait_for_writer_to_close(write_tx: &mpsc::UnboundedSender<ProtocolPacket>) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let packet = ProtocolPacket::new(PacketType::Ping, serde_json::json!({}));
+                if write_tx.send(packet).is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("writer stayed alive after connection shutdown");
+    }
+
+    #[test]
+    fn kdeconnect_lan_filter_allows_private_link_local_loopback_and_cgnat() {
+        assert!(is_private_kdeconnect_addr(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 2
+        ))));
+        assert!(is_private_kdeconnect_addr(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 2
+        ))));
+        assert!(is_private_kdeconnect_addr(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_private_kdeconnect_addr(IpAddr::V4(Ipv4Addr::new(
+            100, 64, 1, 2
+        ))));
+        assert!(is_private_kdeconnect_addr(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(is_private_kdeconnect_addr(IpAddr::V6(
+            "fc00::1".parse().unwrap()
+        )));
+    }
+
+    #[test]
+    fn kdeconnect_lan_filter_rejects_public_internet_addresses() {
+        assert!(!is_private_kdeconnect_addr(IpAddr::V4(Ipv4Addr::new(
+            8, 8, 8, 8
+        ))));
+        assert!(!is_private_kdeconnect_addr(IpAddr::V6(
+            "2001:4860:4860::8888".parse().unwrap()
+        )));
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_suppresses_immediate_duplicate_device_connections() {
+        let limiter = ConnectionRateLimiter::default();
+        let id = DeviceId("duplicate-device-000000000000000".to_string());
+
+        assert!(limiter.allow_device_connection(&id).await);
+        assert!(!limiter.allow_device_connection(&id).await);
+    }
+
+    #[tokio::test]
+    async fn reader_eof_closes_writer_without_waiting_for_heartbeat() {
+        let (write_tx, mut event_rx, _shutdown_tx, mut remote, id) =
+            start_test_connection(100).await;
+
+        remote.shutdown().await.unwrap();
+
+        wait_for_disconnect(&mut event_rx, &id, 100).await;
+        wait_for_writer_to_close(&write_tx).await;
+    }
+
+    #[tokio::test]
+    async fn presenter_burst_then_peer_close_drops_writer() {
+        let (write_tx, mut event_rx, _shutdown_tx, mut remote, id) =
+            start_test_connection(101).await;
+
+        for _ in 0..32 {
+            let packet = ProtocolPacket::new(
+                PacketType::Presenter,
+                serde_json::json!({ "dx": 0.01, "dy": -0.02 }),
+            );
+            remote.write_all(&packet.as_raw().unwrap()).await.unwrap();
+        }
+        let stop = ProtocolPacket::new(PacketType::Presenter, serde_json::json!({ "stop": true }));
+        remote.write_all(&stop.as_raw().unwrap()).await.unwrap();
+        remote.shutdown().await.unwrap();
+
+        wait_for_disconnect(&mut event_rx, &id, 101).await;
+        wait_for_writer_to_close(&write_tx).await;
+    }
+
+    #[tokio::test]
+    async fn superseded_transport_shutdown_drops_writer() {
+        let (write_tx, mut event_rx, shutdown_tx, _remote, id) = start_test_connection(102).await;
+
+        shutdown_tx.send(true).unwrap();
+
+        wait_for_disconnect(&mut event_rx, &id, 102).await;
+        wait_for_writer_to_close(&write_tx).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_writer_blocked_by_unread_peer() {
+        let (write_tx, mut event_rx, shutdown_tx, mut remote, id) =
+            start_test_connection_with_capacity(103, 64).await;
+
+        let packet = ProtocolPacket::new(
+            PacketType::Ping,
+            serde_json::json!({ "message": "x".repeat(8192) }),
+        );
+        write_tx.send(packet).unwrap();
+
+        let mut first_byte = [0u8; 1];
+        timeout(Duration::from_secs(1), remote.read_exact(&mut first_byte))
+            .await
+            .expect("writer never started writing")
+            .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+
+        wait_for_disconnect(&mut event_rx, &id, 103).await;
+        wait_for_writer_to_close(&write_tx).await;
+    }
 }
