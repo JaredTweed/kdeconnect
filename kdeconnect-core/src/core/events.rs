@@ -165,16 +165,30 @@ impl KdeConnectCore {
                 addr,
                 id,
                 name,
-                device_type,
-                incoming_capabilities,
-                outgoing_capabilities,
-                protocol_version,
-                pairing_timestamp,
-                peer_certificate,
                 write_tx,
-                shutdown_tx,
                 conn_id,
             } => {
+                debug!("[core] new connection from: {}", addr);
+
+                let meta = crate::transport::take_conn_metadata(&id).unwrap_or_else(|| {
+                    crate::transport::ConnMetadata {
+                        device_type: "phone".to_string(),
+                        incoming_capabilities: vec![],
+                        outgoing_capabilities: vec![],
+                        protocol_version: 0,
+                        pairing_timestamp: 0,
+                        peer_certificate: vec![],
+                        shutdown_tx: tokio::sync::watch::channel(false).0,
+                        incoming_conn_id: 0,
+                    }
+                });
+                let device_type = meta.device_type;
+                let incoming_capabilities = meta.incoming_capabilities;
+                let outgoing_capabilities = meta.outgoing_capabilities;
+                let protocol_version = meta.protocol_version;
+                let pairing_timestamp = meta.pairing_timestamp;
+                let peer_certificate = meta.peer_certificate;
+                let shutdown_tx = meta.shutdown_tx;
                 debug!("[core] new connection from: {}", addr);
 
                 let mut device = match Device::new(
@@ -359,12 +373,12 @@ impl KdeConnectCore {
                 let _ = self.conn_tx.send(conn_event.clone());
                 let _ = self.mpris_conn_tx.send(conn_event);
             }
-            TransportEvent::IncomingPacket {
-                addr,
-                id,
-                raw,
-                conn_id,
-            } => {
+            TransportEvent::IncomingPacket { addr, id, raw } => {
+                let conn_id = crate::transport::CONN_METADATA
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&id).map(|m| m.incoming_conn_id))
+                    .unwrap_or(0);
                 if !self.is_current_connection(&id, conn_id).await {
                     info!(
                         "[core] stale packet from {} (conn_id {} != current) — ignoring",

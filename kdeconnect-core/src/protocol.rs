@@ -67,7 +67,7 @@ where
     Ok(PacketType::from(s))
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PacketType {
     Battery,
     BatteryRequest,

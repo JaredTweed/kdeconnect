@@ -29,6 +29,9 @@ use crate::{
     plugin_config,
     protocol::{Identity, PacketType, ProtocolPacket},
 };
+use std::sync::Mutex as StdMutex;
+
+use once_cell::sync::Lazy;
 
 pub const DEFAULT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -58,6 +61,33 @@ pub const BROADCAST_ADDR: SocketAddr =
 /// incorrectly wiping a newer live connection out of `writer_map`.
 static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Extra per-connection metadata stored outside TransportEvent so the enum
+/// stays compatible with upstream's shape (no `device_type`, `shutdown_tx`,
+/// `peer_certificate`, etc. in the event fields).  Core reads this map after
+/// consuming a `NewConnection` / `IncomingPacket` / … event.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnMetadata {
+    pub device_type: String,
+    pub incoming_capabilities: Vec<String>,
+    pub outgoing_capabilities: Vec<String>,
+    pub protocol_version: usize,
+    pub pairing_timestamp: u64,
+    pub peer_certificate: Vec<u8>,
+    pub shutdown_tx: watch::Sender<bool>,
+    /// conn_id of the *next* IncomingPacket (set by the reader task before
+    /// sending the event so the wildcard `IncomingPacket` arm in core can
+    /// look it up).
+    pub incoming_conn_id: u64,
+}
+
+pub(crate) static CONN_METADATA: Lazy<StdMutex<HashMap<DeviceId, ConnMetadata>>> =
+    Lazy::new(|| StdMutex::new(HashMap::new()));
+
+/// Pop and return the metadata for a device, if present.
+pub(crate) fn take_conn_metadata(id: &DeviceId) -> Option<ConnMetadata> {
+    CONN_METADATA.lock().ok()?.remove(id)
+}
+
 #[derive(Default)]
 pub(crate) struct ConnectionRateLimiter {
     by_device: Mutex<HashMap<DeviceId, Instant>>,
@@ -83,41 +113,28 @@ pub enum TransportEvent {
         addr: SocketAddr,
         id: DeviceId,
         raw: String,
-        conn_id: u64,
     },
     NewConnection {
         addr: SocketAddr,
         id: DeviceId,
         name: String,
-        device_type: String,
-        incoming_capabilities: Vec<String>,
-        outgoing_capabilities: Vec<String>,
-        /// Protocol version announced by the peer in its identity packet.
-        protocol_version: usize,
-        /// Pairing timestamp from the peer's identity (used for clock-sync validation).
-        pairing_timestamp: u64,
-        /// DER-encoded TLS certificate presented by the peer.
-        peer_certificate: Vec<u8>,
         write_tx: mpsc::UnboundedSender<ProtocolPacket>,
-        shutdown_tx: watch::Sender<bool>,
-        /// Unique ID for this connection instance.
         conn_id: u64,
     },
-    /// A paired device presented a different TLS certificate than the one
-    /// pinned at pairing time.
-    PairTrustFailed { id: DeviceId },
-    /// A packet had already been accepted into the write queue, but the socket
-    /// failed while the writer task was sending it.
+    Disconnected {
+        id: DeviceId,
+        conn_id: u64,
+    },
+    /// Emitted when a paired device presents a mismatched TLS certificate.
+    PairTrustFailed {
+        id: DeviceId,
+    },
+    /// Emitted by the writer task when a packet could not be sent to the peer.
     PacketSendFailed {
         id: DeviceId,
         packet_type: PacketType,
         conn_id: u64,
     },
-    /// Emitted when the reader loop ends (peer closed / broken pipe).
-    /// `conn_id` must match the stored value for this device before core
-    /// removes the writer_map entry; a mismatch means a newer connection
-    /// has already replaced this one.
-    Disconnected { id: DeviceId, conn_id: u64 },
 }
 
 /// Enable TCP keepalive so the OS detects a dead connection within ~25s
@@ -465,18 +482,28 @@ async fn handle_incoming_tcp(
 
     let conn_id = CONN_COUNTER.fetch_add(1, Ordering::Relaxed);
 
+    {
+        let mut meta = CONN_METADATA.lock().expect("CONN_METADATA poisoned");
+        meta.insert(
+            DeviceId(peer_identity.device_id.clone()),
+            ConnMetadata {
+                device_type: peer_identity.device_type.to_string(),
+                incoming_capabilities: peer_identity.incoming_capabilities,
+                outgoing_capabilities: peer_identity.outgoing_capabilities,
+                protocol_version: peer_identity.protocol_version,
+                pairing_timestamp: 0,
+                peer_certificate,
+                shutdown_tx: shutdown_tx.clone(),
+                incoming_conn_id: 0,
+            },
+        );
+    }
+
     if let Err(e) = event_tx.send(TransportEvent::NewConnection {
         addr: peer,
         id: DeviceId(peer_identity.device_id),
         name: name.clone(),
-        device_type: peer_identity.device_type.to_string(),
-        incoming_capabilities: peer_identity.incoming_capabilities,
-        outgoing_capabilities: peer_identity.outgoing_capabilities,
-        protocol_version: peer_identity.protocol_version,
-        pairing_timestamp: 0,
-        peer_certificate,
         write_tx,
-        shutdown_tx,
         conn_id,
     }) {
         return Err(anyhow::anyhow!("transport event channel closed: {}", e));
@@ -785,18 +812,28 @@ async fn handle_discovered_device(
 
     let conn_id = CONN_COUNTER.fetch_add(1, Ordering::Relaxed);
 
+    {
+        let mut meta = CONN_METADATA.lock().expect("CONN_METADATA poisoned");
+        meta.insert(
+            DeviceId(peer_identity.device_id.clone()),
+            ConnMetadata {
+                device_type: peer_identity.device_type.to_string(),
+                incoming_capabilities: peer_identity.incoming_capabilities,
+                outgoing_capabilities: peer_identity.outgoing_capabilities,
+                protocol_version: peer_identity.protocol_version,
+                pairing_timestamp: 0,
+                peer_certificate,
+                shutdown_tx: shutdown_tx.clone(),
+                incoming_conn_id: 0,
+            },
+        );
+    }
+
     if let Err(e) = event_tx.send(TransportEvent::NewConnection {
         addr: peer,
         id: DeviceId(peer_identity.device_id),
         name: name.clone(),
-        device_type: peer_identity.device_type.to_string(),
-        incoming_capabilities: peer_identity.incoming_capabilities,
-        outgoing_capabilities: peer_identity.outgoing_capabilities,
-        protocol_version: peer_identity.protocol_version,
-        pairing_timestamp: 0,
-        peer_certificate,
         write_tx,
-        shutdown_tx,
         conn_id,
     }) {
         return Err(anyhow::anyhow!("transport event channel closed: {}", e));
@@ -963,11 +1000,30 @@ where
                     // sensitive data eg. from sms
                     // eprintln!("[reader] raw bytes from {}: {:?}", peer, trimmed);
 
+                    if let Ok(mut meta) = CONN_METADATA.lock() {
+                        if let Some(data) = meta.get_mut(&id_reader) {
+                            data.incoming_conn_id = conn_id;
+                        } else {
+                            meta.insert(
+                                id_reader.clone(),
+                                ConnMetadata {
+                                    device_type: String::new(),
+                                    incoming_capabilities: vec![],
+                                    outgoing_capabilities: vec![],
+                                    protocol_version: 0,
+                                    pairing_timestamp: 0,
+                                    peer_certificate: vec![],
+                                    shutdown_tx: watch::channel(false).0,
+                                    incoming_conn_id: conn_id,
+                                },
+                            );
+                        }
+                    }
+
                     if let Err(e) = event_tx_reader.send(TransportEvent::IncomingPacket {
                         addr: peer,
                         id: id_reader.clone(),
                         raw: trimmed.to_string(),
-                        conn_id,
                     }) {
                         error!(peer = ?peer, "[reader loop] transport event channel closed: {}", e);
                         break;

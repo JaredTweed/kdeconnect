@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
     sync::Arc,
 };
 use tokio::{
@@ -13,15 +15,6 @@ use crate::{
     device::Device,
     event::{ConnectionEvent, CoreEvent},
     filetransfer::{TransferAdapter, send_progress},
-    plugins::{
-        self,
-        battery::Battery,
-        clipboard::Clipboard,
-        connectivity_report::ConnectivityReport,
-        mpris::{Mpris, MprisRequest},
-        systemvolume::SystemVolumeRequest,
-        telephony::TelephonyPacket,
-    },
     protocol::{PacketPayloadTransferInfo, PacketType, ProtocolPacket},
     transport::prepare_listener_for_payload,
 };
@@ -75,9 +68,23 @@ fn packet_plugin_id(pt: &PacketType) -> Option<&'static str> {
     }
 }
 
+/// A type-erased packet handler stored in the registry.
+type HandlerFn = dyn Fn(
+        Device,
+        serde_json::Value,
+        mpsc::UnboundedSender<CoreEvent>,
+        mpsc::UnboundedSender<ConnectionEvent>,
+        mpsc::UnboundedSender<ConnectionEvent>,
+        Option<PacketPayloadTransferInfo>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+    + Send
+    + Sync;
+
 #[derive(Clone)]
 pub struct PluginRegistry {
     plugins: Arc<RwLock<Vec<Arc<dyn Plugin>>>>,
+    /// PacketType → handler function (registered at startup).
+    handlers: Arc<RwLock<HashMap<PacketType, Arc<HandlerFn>>>>,
     /// device_id.0 → set of disabled plugin IDs
     disabled: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
@@ -86,6 +93,7 @@ impl PluginRegistry {
     pub fn new() -> Self {
         Self {
             plugins: Arc::new(RwLock::new(Vec::new())),
+            handlers: Arc::new(RwLock::new(HashMap::new())),
             disabled: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -94,6 +102,11 @@ impl PluginRegistry {
         let mut plugins = self.plugins.write().await;
         info!("Registering plugin: {}", plugin.id());
         plugins.push(plugin);
+    }
+
+    /// Register a handler for a specific PacketType.
+    pub async fn register_handler(&self, packet_type: PacketType, handler: Arc<HandlerFn>) {
+        self.handlers.write().await.insert(packet_type, handler);
     }
 
     /// Replace the disabled set for a device (called on connect and on toggle).
@@ -132,262 +145,27 @@ impl PluginRegistry {
             return;
         }
 
-        let body = packet.body.clone();
         info!("[dispatch] packet type: {:?}", packet.packet_type);
-        let core_tx = core_tx.clone();
-        let connection_tx = tx.clone();
-        let mpris_connection_tx = mpris_tx.clone();
-        let payload_info = packet.payload_transfer_info;
 
-        match packet.packet_type {
-            PacketType::Identity => {
-                debug!("Skipping identity packet");
-            }
-            PacketType::Pair => {
-                debug!("Skipping pair packet");
-            }
-            PacketType::Battery => {
-                if let Ok(battery) = serde_json::from_value::<Battery>(body) {
-                    battery
-                        .received_packet(device.device_id.clone(), connection_tx)
-                        .await;
-                }
-            }
-            PacketType::BatteryRequest => {
-                plugins::battery::send_local_state(device.device_id.clone(), core_tx).await;
-            }
-            PacketType::SmsMessages => {
-                debug!("Received SmsMessages packet");
-                if let Ok(sms_messages) =
-                    serde_json::from_value::<plugins::sms::SmsMessages>(body.clone())
-                {
-                    info!(
-                        "Received SMS messages packet with {} messages",
-                        sms_messages.messages.len()
-                    );
-                    debug!(
-                        "Successfully parsed {} SMS messages",
-                        sms_messages.messages.len()
-                    );
-                    sms_messages
-                        .received_packet(device.device_id.0.clone(), connection_tx)
-                        .await;
-                } else {
-                    warn!("Failed to parse SMS messages packet: {:?}", body);
-                }
-            }
-            PacketType::ContactsResponseUidsTimestamps => {
-                debug!("Received ContactsResponseUidsTimestamps");
-                if let Some(uids_val) = body.get("uids").and_then(|v| v.as_array()) {
-                    let uids: Vec<String> = uids_val
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect();
-                    if !uids.is_empty() {
-                        debug!("Requesting vcards for {} UIDs", uids.len());
-                        let packet = ProtocolPacket::new(
-                            PacketType::ContactsRequestVcardsByUid,
-                            serde_json::json!({ "uids": uids }),
-                        );
-                        let _ = core_tx.send(CoreEvent::SendPacket {
-                            device: device.device_id.clone(),
-                            packet,
-                        });
-                    }
-                }
-            }
-            PacketType::ContactsResponseVcards => {
-                debug!("Received ContactsResponseVcards");
-                let mut contacts: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
-                if let Some(uids_val) = body.get("uids").and_then(|v| v.as_array()) {
-                    for uid_val in uids_val {
-                        if let Some(uid) = uid_val.as_str()
-                            && let Some(vcard_str) = body.get(uid).and_then(|v| v.as_str())
-                        {
-                            let (name_opt, phones) = parse_vcard(vcard_str);
-                            if let Some(name) = name_opt {
-                                for phone in phones {
-                                    contacts.insert(phone, name.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                debug!("Parsed {} phone->name contact entries", contacts.len());
-                if !contacts.is_empty() {
-                    let _ = connection_tx.send(ConnectionEvent::ContactsReceived(
-                        device.device_id.clone(),
-                        contacts,
-                    ));
-                }
-            }
-            PacketType::Clipboard => {
-                if let Ok(clipboard) = serde_json::from_value::<Clipboard>(body) {
-                    clipboard.received_packet(connection_tx).await;
-                }
-            }
-            PacketType::ConnectivityReport => {
-                if let Ok(connectivity_rep) = serde_json::from_value::<ConnectivityReport>(body) {
-                    connectivity_rep
-                        .received_packet(device.device_id.clone(), connection_tx)
-                        .await;
-                }
-            }
-            PacketType::ConnectivityReportRequest => {
-                debug!(
-                    "ConnectivityReportRequest received — desktop has no cellular modem state to publish"
-                );
-            }
-            PacketType::ClipboardConnect => {
-                if let Ok(clipboard) = serde_json::from_value::<Clipboard>(body) {
-                    if let Some(timestamp) = clipboard.timestamp {
-                        debug!("Clipboard sync on connect accepted (ts={})", timestamp);
-                    }
-                    clipboard.received_packet(connection_tx).await;
-                }
-            }
-            PacketType::MousePadKeyboardState => {
-                if let Ok(keyboard_state) =
-                    serde_json::from_value::<plugins::mousepad::KeyboardState>(body)
-                {
-                    debug!("{:?}", keyboard_state);
-                }
-            }
-            PacketType::MousePadRequest => {
-                if let Ok(request) =
-                    serde_json::from_value::<plugins::mousepad::MousepadRequest>(body)
-                {
-                    request.received_packet(&device, core_tx).await;
-                }
-            }
-            PacketType::MousePadEcho => {
-                debug!("MousePadEcho received");
-            }
-            PacketType::Presenter => {
-                if let Ok(request) =
-                    serde_json::from_value::<plugins::mousepad::PresenterRequest>(body)
-                {
-                    request.received_packet().await;
-                }
-            }
-            PacketType::Mpris => {
-                if let Ok(mpris_packet) = serde_json::from_value::<Mpris>(body) {
-                    info!("Received MPRIS packet: {:?}", mpris_packet);
-                    let mpris_event =
-                        ConnectionEvent::Mpris((device.device_id.clone(), mpris_packet));
-                    let _ = connection_tx.send(mpris_event.clone());
-                    let _ = mpris_connection_tx.send(mpris_event);
-                }
-            }
-            PacketType::MprisRequest => {
-                if let Ok(mpris_request) = serde_json::from_value::<MprisRequest>(body) {
-                    mpris_request.received_packet(&device, core_tx).await;
-                }
-            }
-            PacketType::Notification => {
-                debug!("Received notification packet");
-                if let Ok(notification) =
-                    serde_json::from_value::<plugins::notification::Notification>(body)
-                {
-                    notification.received_packet(&device, core_tx).await;
-                }
-            }
-            PacketType::NotificationRequest => {
-                if let Ok(request) =
-                    serde_json::from_value::<plugins::notification::NotificationRequest>(body)
-                {
-                    request.received_packet().await;
-                }
-            }
-            PacketType::FindMyPhoneRequest => {
-                plugins::findmyphone::handle_request(&device).await;
-            }
-            PacketType::Ping => {
-                if let Ok(ping) = serde_json::from_value::<plugins::ping::Ping>(body) {
-                    ping.received_packet(&device, core_tx).await;
-                }
-            }
-            PacketType::RunCommand => {
-                if let Ok(run_command) =
-                    serde_json::from_value::<plugins::run_command::RunCommand>(body)
-                {
-                    run_command
-                        .received_packet(&device, connection_tx, core_tx)
-                        .await;
-                }
-            }
-            PacketType::RunCommandRequest => {
-                if let Ok(run_command_request) =
-                    serde_json::from_value::<plugins::run_command::RunCommandRequest>(body)
-                {
-                    run_command_request
-                        .received_packet(&device, connection_tx, core_tx)
-                        .await;
-                }
-            }
-            PacketType::ShareRequest => {
-                if let Ok(share_request) =
-                    serde_json::from_value::<plugins::share::ShareRequest>(body)
-                {
-                    // Spawn so the event loop is not blocked during the
-                    // notification dialog wait + network payload download.
-                    tokio::spawn(async move {
-                        if let Err(e) = share_request
-                            .receive_share(&device, payload_info.as_ref())
-                            .await
-                        {
-                            warn!("[share] receive_share failed: {}", e);
-                        }
-                    });
-                }
-            }
-            PacketType::Sftp => {
-                if let Ok(packet) = serde_json::from_value::<plugins::sftp::Sftp>(body) {
-                    packet.received_packet(&device).await;
-                }
-            }
-            PacketType::SystemVolumeRequest => {
-                if let Ok(req) = serde_json::from_value::<SystemVolumeRequest>(body) {
-                    req.handle(&device, core_tx).await;
-                }
-            }
-            PacketType::Telephony => {
-                if let Ok(pkt) = serde_json::from_value::<TelephonyPacket>(body) {
-                    pkt.received_packet(&device, core_tx).await;
-                }
-            }
-            PacketType::TelephonyRequestMute => {
-                debug!("TelephonyRequestMute received — no action needed on desktop");
-            }
-            PacketType::DigitizerSession => {
-                if let Ok(session) =
-                    serde_json::from_value::<plugins::digitizer::DigitizerSession>(body)
-                {
-                    session.received_packet().await;
-                }
-            }
-            PacketType::Digitizer => {
-                if let Ok(event) =
-                    serde_json::from_value::<plugins::digitizer::DigitizerEvent>(body)
-                {
-                    event.received_packet().await;
-                }
-            }
-            _ => {
-                debug!(
-                    "No plugin found to handle packet type: {:?}",
-                    packet.packet_type
-                );
-            }
+        if let Some(handler) = self.handlers.read().await.get(&packet.packet_type).cloned() {
+            handler(
+                device,
+                packet.body.clone(),
+                core_tx,
+                tx,
+                mpris_tx,
+                packet.payload_transfer_info,
+            )
+            .await;
+        } else {
+            debug!(
+                "No handler registered for packet type: {:?}",
+                packet.packet_type
+            );
         }
     }
 
     /// Send a packet that carries a binary payload (file / album art).
-    ///
-    /// The packet is enqueued immediately so the phone knows which port to
-    /// connect to. The actual TLS accept + byte copy is spawned as a
-    /// background task so the event loop is never blocked.
     pub async fn send_payload(
         &self,
         packet: ProtocolPacket,
@@ -417,12 +195,9 @@ impl PluginRegistry {
         let payload_transfer_info = Some(PacketPayloadTransferInfo { port: addr.port() });
         let body = packet.body.clone();
 
-        // Enqueue the packet with the port info NOW — the phone needs this to
-        // know where to connect. This is non-blocking (channel send).
         match packet.packet_type {
             PacketType::Mpris => {
-                if let Ok(mpris) = serde_json::from_value::<plugins::mpris::Mpris>(body) {
-                    debug!("got mpris packet, sending info.");
+                if let Ok(mpris) = serde_json::from_value::<crate::plugins::mpris::Mpris>(body) {
                     let _ = mpris
                         .send_art(device_writer, payload_size, payload_transfer_info)
                         .await;
@@ -430,9 +205,8 @@ impl PluginRegistry {
             }
             PacketType::ShareRequest => {
                 if let Ok(share_request) =
-                    serde_json::from_value::<plugins::share::ShareRequest>(body)
+                    serde_json::from_value::<crate::plugins::share::ShareRequest>(body)
                 {
-                    debug!("got share request packet, sending info.");
                     let _ = share_request
                         .send_file(device_writer, payload_size, payload_transfer_info)
                         .await;
@@ -440,15 +214,13 @@ impl PluginRegistry {
             }
             _ => {
                 warn!(
-                    "[payload] No plugin found to handle packet type: {:?}",
+                    "[payload] No handler for packet type: {:?}",
                     packet.packet_type
                 );
                 return;
             }
         }
 
-        // Spawn the accept + copy so the event loop stays responsive for the
-        // entire duration of the file transfer.
         let server_config = GLOBAL_CONFIG.get().unwrap().key_store.server_config.clone();
         tokio::spawn(async move {
             let (incoming, peer_addr) = match free_listener.accept().await {
@@ -481,8 +253,6 @@ impl PluginRegistry {
                 return;
             }
             let _ = stream.shutdown().await;
-            // Guarantee a final 100% progress event so the UI always clears
-            // regardless of file size or interval timing.
             send_progress(100, payload.notify_tx.clone());
             info!("[payload] successfully sent payload to {}", peer_addr);
         });
@@ -499,12 +269,14 @@ impl PluginRegistry {
 
         match packet.packet_type {
             PacketType::Ping => {
-                if let Ok(ping) = serde_json::from_value::<plugins::ping::Ping>(body) {
+                if let Ok(ping) = serde_json::from_value::<crate::plugins::ping::Ping>(body) {
                     ping.send_packet(&device, core_event).await;
                 }
             }
             PacketType::MprisRequest => {
-                if let Ok(mpris_request) = serde_json::from_value::<MprisRequest>(body) {
+                if let Ok(mpris_request) =
+                    serde_json::from_value::<crate::plugins::mpris::MprisRequest>(body)
+                {
                     mpris_request.send_packet(&device, core_event).await;
                 }
             }
@@ -521,32 +293,4 @@ impl PluginRegistry {
         let plugins = self.plugins.read().await;
         plugins.iter().map(|p| p.id().to_string()).collect()
     }
-}
-
-fn parse_vcard(content: &str) -> (Option<String>, Vec<String>) {
-    let mut name: Option<String> = None;
-    let mut phones: Vec<String> = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(stripped) = line.strip_prefix("FN:") {
-            name = Some(stripped.trim().to_string());
-        } else if name.is_none() && line.starts_with("N:") {
-            let parts: Vec<&str> = line[2..].split(';').collect();
-            if parts.len() >= 2 {
-                let full = format!("{} {}", parts[1].trim(), parts[0].trim());
-                let full = full.trim().to_string();
-                if !full.is_empty() {
-                    name = Some(full);
-                }
-            }
-        } else if line.starts_with("TEL")
-            && let Some(pos) = line.rfind(':')
-        {
-            let phone = line[pos + 1..].trim().to_string();
-            if !phone.is_empty() {
-                phones.push(phone);
-            }
-        }
-    }
-    (name, phones)
 }

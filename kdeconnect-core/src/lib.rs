@@ -5,20 +5,17 @@ use std::{
 };
 use tokio::{
     select,
-    sync::{Mutex, mpsc, watch},
+    sync::{Mutex, mpsc},
     time::MissedTickBehavior,
 };
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    core::connection::{
-        ConnectionHandle, UnpairedResyncLimiter,
-    },
+    core::connection::{ConnectionHandle, UnpairedResyncLimiter},
     device::{Device, DeviceId, DeviceManager, PairState},
     event::{AppEvent, ConnectionEvent, CoreEvent},
     pairing::PairingManager,
     plugin_interface::PluginRegistry,
-    protocol::Pair,
     transport::{ConnectionRateLimiter, TcpTransport, TransportEvent, UdpTransport},
 };
 
@@ -177,6 +174,446 @@ impl KdeConnectCore {
             device_id: None,
         };
         plugin_registry.register(Arc::new(sms_plugin)).await;
+
+        use protocol::PacketType;
+        
+
+        fn parse_vcard(content: &str) -> (Option<String>, Vec<String>) {
+            let mut name = None;
+            let mut phones = vec![];
+            for line in content.lines() {
+                let line = line.trim();
+                if let Some(s) = line.strip_prefix("FN:") {
+                    name = Some(s.trim().to_string());
+                } else if name.is_none() && line.starts_with("N:") {
+                    let p: Vec<&str> = line[2..].split(';').collect();
+                    if p.len() >= 2 {
+                        let f = format!("{} {}", p[1].trim(), p[0].trim())
+                            .trim()
+                            .to_string();
+                        if !f.is_empty() {
+                            name = Some(f);
+                        }
+                    }
+                } else if line.starts_with("TEL")
+                    && let Some(pos) = line.rfind(':')
+                {
+                    let ph = line[pos + 1..].trim().to_string();
+                    if !ph.is_empty() {
+                        phones.push(ph);
+                    }
+                }
+            }
+            (name, phones)
+        }
+
+        plugin_registry
+            .register_handler(
+                PacketType::Battery,
+                Arc::new(|device, body, _ct, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(battery) =
+                            serde_json::from_value::<plugins::battery::Battery>(body)
+                        {
+                            battery
+                                .received_packet(device.device_id.clone(), conn_tx)
+                                .await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::BatteryRequest,
+                Arc::new(|device, _body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        plugins::battery::send_local_state(device.device_id.clone(), core_tx).await;
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Clipboard,
+                Arc::new(|_d, body, _ct, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(cb) =
+                            serde_json::from_value::<plugins::clipboard::Clipboard>(body)
+                        {
+                            cb.received_packet(conn_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::ClipboardConnect,
+                Arc::new(|_d, body, _ct, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(cb) =
+                            serde_json::from_value::<plugins::clipboard::Clipboard>(body)
+                        {
+                            if let Some(ts) = cb.timestamp {
+                                debug!("Clipboard sync on connect accepted (ts={})", ts);
+                            }
+                            cb.received_packet(conn_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::ConnectivityReport,
+                Arc::new(|device, body, _ct, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(rep) = serde_json::from_value::<
+                            plugins::connectivity_report::ConnectivityReport,
+                        >(body)
+                        {
+                            rep.received_packet(device.device_id.clone(), conn_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry.register_handler(PacketType::ConnectivityReportRequest, Arc::new(|_d, _b, _ct, _conn, _mt, _pi| Box::pin(async move {
+            debug!("ConnectivityReportRequest received — desktop has no cellular modem state");
+        }))).await;
+        plugin_registry
+            .register_handler(
+                PacketType::ContactsResponseUidsTimestamps,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Some(arr) = body.get("uids").and_then(|v| v.as_array()) {
+                            let uids: Vec<String> = arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect();
+                            if !uids.is_empty() {
+                                let pkt = ProtocolPacket::new(
+                                    PacketType::ContactsRequestVcardsByUid,
+                                    serde_json::json!({"uids": uids}),
+                                );
+                                let _ = core_tx.send(CoreEvent::SendPacket {
+                                    device: device.device_id.clone(),
+                                    packet: pkt,
+                                });
+                            }
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::ContactsResponseVcards,
+                Arc::new(|device, body, _ct, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        let mut contacts: std::collections::HashMap<String, String> =
+                            std::collections::HashMap::new();
+                        if let Some(arr) = body.get("uids").and_then(|v| v.as_array()) {
+                            for uid_val in arr {
+                                if let Some(uid) = uid_val.as_str()
+                                    && let Some(vcard) = body.get(uid).and_then(|v| v.as_str())
+                                {
+                                    let (n, ps) = parse_vcard(vcard);
+                                    if let Some(name) = n {
+                                        for phone in ps {
+                                            contacts.insert(phone, name.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !contacts.is_empty() {
+                            let _ = conn_tx.send(ConnectionEvent::ContactsReceived(
+                                device.device_id.clone(),
+                                contacts,
+                            ));
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::FindMyPhoneRequest,
+                Arc::new(|device, _b, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        plugins::findmyphone::handle_request(&device).await;
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Mpris,
+                Arc::new(|device, body, _ct, conn_tx, mpris_tx, _pi| {
+                    Box::pin(async move {
+                        if let Ok(pkt) = serde_json::from_value::<plugins::mpris::Mpris>(body) {
+                            let ev = ConnectionEvent::Mpris((device.device_id.clone(), pkt));
+                            let _ = conn_tx.send(ev.clone());
+                            let _ = mpris_tx.send(ev);
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::MprisRequest,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(req) =
+                            serde_json::from_value::<plugins::mpris::MprisRequest>(body)
+                        {
+                            req.received_packet(&device, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::MousePadKeyboardState,
+                Arc::new(|_d, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(ks) =
+                            serde_json::from_value::<plugins::mousepad::KeyboardState>(body)
+                        {
+                            debug!("{:?}", ks);
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::MousePadEcho,
+                Arc::new(|_d, _b, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        debug!("MousePadEcho received");
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::MousePadRequest,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(req) =
+                            serde_json::from_value::<plugins::mousepad::MousepadRequest>(body)
+                        {
+                            req.received_packet(&device, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Presenter,
+                Arc::new(|_d, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(req) =
+                            serde_json::from_value::<plugins::mousepad::PresenterRequest>(body)
+                        {
+                            req.received_packet().await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Notification,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(n) =
+                            serde_json::from_value::<plugins::notification::Notification>(body)
+                        {
+                            n.received_packet(&device, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::NotificationRequest,
+                Arc::new(|_d, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(req) = serde_json::from_value::<
+                            plugins::notification::NotificationRequest,
+                        >(body)
+                        {
+                            req.received_packet().await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Ping,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(ping) = serde_json::from_value::<plugins::ping::Ping>(body) {
+                            ping.received_packet(&device, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::RunCommand,
+                Arc::new(|device, body, core_tx, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(rc) =
+                            serde_json::from_value::<plugins::run_command::RunCommand>(body)
+                        {
+                            rc.received_packet(&device, conn_tx, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::RunCommandRequest,
+                Arc::new(|device, body, core_tx, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(rcr) =
+                            serde_json::from_value::<plugins::run_command::RunCommandRequest>(body)
+                        {
+                            rcr.received_packet(&device, conn_tx, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Sftp,
+                Arc::new(|device, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(pkt) = serde_json::from_value::<plugins::sftp::Sftp>(body) {
+                            pkt.received_packet(&device).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::ShareRequest,
+                Arc::new(|device, body, _ct, _conn, _mt, payload_info| {
+                    Box::pin(async move {
+                        if let Ok(sr) = serde_json::from_value::<plugins::share::ShareRequest>(body)
+                        {
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    sr.receive_share(&device, payload_info.as_ref()).await
+                                {
+                                    warn!("[share] receive_share failed: {}", e);
+                                }
+                            });
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::SmsMessages,
+                Arc::new(|device, body, _ct, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(sms) = serde_json::from_value::<plugins::sms::SmsMessages>(body) {
+                            info!(
+                                "Received SMS messages packet with {} messages",
+                                sms.messages.len()
+                            );
+                            sms.received_packet(device.device_id.0.clone(), conn_tx)
+                                .await;
+                        } else {
+                            warn!("Failed to parse SMS messages packet");
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::SystemVolumeRequest,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(req) = serde_json::from_value::<
+                            plugins::systemvolume::SystemVolumeRequest,
+                        >(body)
+                        {
+                            req.handle(&device, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Telephony,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(pkt) =
+                            serde_json::from_value::<plugins::telephony::TelephonyPacket>(body)
+                        {
+                            pkt.received_packet(&device, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::TelephonyRequestMute,
+                Arc::new(|_d, _b, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        debug!("TelephonyRequestMute received — no action needed on desktop");
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::DigitizerSession,
+                Arc::new(|_d, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(s) =
+                            serde_json::from_value::<plugins::digitizer::DigitizerSession>(body)
+                        {
+                            s.received_packet().await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Digitizer,
+                Arc::new(|_d, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(e) =
+                            serde_json::from_value::<plugins::digitizer::DigitizerEvent>(body)
+                        {
+                            e.received_packet().await;
+                        }
+                    })
+                }),
+            )
+            .await;
 
         plugins::mpris::init_telephony_signal();
         plugins::mpris::expose_phone_mpris(mpris_conn_rx, event_tx.clone());
