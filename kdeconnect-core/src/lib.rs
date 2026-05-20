@@ -8,6 +8,11 @@ use tokio::{
     sync::{Mutex, mpsc},
     time::MissedTickBehavior,
 };
+// Used in test code — keep so cargo fix doesn't remove them
+#[cfg_attr(not(test), allow(unused_imports))]
+use crate::protocol::Pair;
+#[cfg_attr(not(test), allow(unused_imports))]
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use crate::{
