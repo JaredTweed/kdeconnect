@@ -59,12 +59,9 @@ fn packet_plugin_id(pt: &PacketType) -> Option<&'static str> {
         | PacketType::MousePadRequest => Some("mousepad"),
         PacketType::Presenter => Some("presenter"),
         PacketType::Telephony | PacketType::TelephonyRequestMute => Some("telephony"),
+        PacketType::Lock | PacketType::LockRequest => Some("lock"),
         // Core / unmanaged packets are never gated
-        PacketType::Identity
-        | PacketType::Pair
-        | PacketType::Lock
-        | PacketType::LockRequest
-        | PacketType::Unknown(_) => None,
+        PacketType::Identity | PacketType::Pair | PacketType::Unknown(_) => None,
     }
 }
 

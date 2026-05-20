@@ -534,6 +534,16 @@ impl KdeConnectCore {
             .await;
         plugin_registry
             .register_handler(
+                PacketType::ShareRequestUpdate,
+                Arc::new(|_d, _body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        debug!("ShareRequestUpdate received (progress update from phone)");
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
                 PacketType::SmsMessages,
                 Arc::new(|device, body, _ct, conn_tx, _mt, _pi| {
                     Box::pin(async move {
@@ -547,6 +557,19 @@ impl KdeConnectCore {
                         } else {
                             warn!("Failed to parse SMS messages packet");
                         }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::SmsAttachmentFile,
+                Arc::new(|_d, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        debug!(
+                            "SmsAttachmentFile received: {:?}",
+                            body.get("filename").and_then(|v| v.as_str())
+                        );
                     })
                 }),
             )
@@ -586,6 +609,26 @@ impl KdeConnectCore {
                 Arc::new(|_d, _b, _ct, _conn, _mt, _pi| {
                     Box::pin(async move {
                         debug!("TelephonyRequestMute received — no action needed on desktop");
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Lock,
+                Arc::new(|device, _body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        info!("Phone {} requested desktop lock", device.name);
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::LockRequest,
+                Arc::new(|_d, _body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        debug!("LockRequest received");
                     })
                 }),
             )

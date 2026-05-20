@@ -33,6 +33,7 @@ const INCOMING_CAPABILITIES: &[&str] = &[
     "kdeconnect.mousepad.keyboardstate",
     "kdeconnect.mousepad.request",
     "kdeconnect.mpris",
+    "kdeconnect.mpris.request",
     "kdeconnect.notification",
     "kdeconnect.notification.request",
     "kdeconnect.ping",
