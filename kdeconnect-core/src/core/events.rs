@@ -800,8 +800,14 @@ impl KdeConnectCore {
                 let _ = self.queue_packet(&device_id, pkt).await;
             }
             AppEvent::SendPacket(device_id, packet) => {
-                info!("Sending packet to device: {}", device_id);
-                let _ = self.queue_packet(&device_id, packet).await;
+                let ptype = packet.packet_type.clone();
+                info!("Sending packet {:?} to device: {}", ptype, device_id);
+                if !self.queue_packet(&device_id, packet).await {
+                    warn!(
+                        "[core] failed to send {:?} to {} (not paired or no connection)",
+                        ptype, device_id
+                    );
+                }
             }
             AppEvent::SendFiles((device_id, files_list)) => {
                 info!("frontend trying to sent files to device: {}", device_id);

@@ -1278,11 +1278,12 @@ async fn filtered_identity_for_device(device_id: &str) -> Identity {
         ("sftp", &["kdeconnect.sftp"], &["kdeconnect.sftp.request"]),
         (
             "sms",
-            &["kdeconnect.sms.messages"],
+            &["kdeconnect.sms.messages", "kdeconnect.sms.attachment_file"],
             &[
                 "kdeconnect.sms.request",
                 "kdeconnect.sms.request_conversations",
                 "kdeconnect.sms.request_conversation",
+                "kdeconnect.sms.request_attachment",
             ],
         ),
         (

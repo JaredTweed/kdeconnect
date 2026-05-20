@@ -296,7 +296,16 @@ impl DaemonInterface {
     /// Send clipboard content
     async fn send_clipboard(&self, device_id: String, content: String) -> zbus::fdo::Result<()> {
         info!("D-Bus: SendClipboard called for {}", device_id);
-        let packet = ProtocolPacket::new(PacketType::Clipboard, json!({ "content": content }));
+        let packet = ProtocolPacket::new(
+            PacketType::Clipboard,
+            json!({
+                "content": content,
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+            }),
+        );
         self.event_sender
             .send(AppEvent::SendPacket(DeviceId(device_id), packet))
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
