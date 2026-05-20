@@ -546,6 +546,11 @@ impl KdeConnectCore {
                     .await;
                 remove_connection_if_current(&self.writer_map, &self.conn_id_map, &id, conn_id)
                     .await;
+                {
+                    let _ = crate::transport::CONN_METADATA
+                        .lock()
+                        .map(|mut m| m.remove(&id));
+                }
                 plugins::systemvolume::on_device_disconnect(&id);
                 self.broadcast_on_disconnect(&id).await;
                 info!("[core] removed dead connection for {}", id);

@@ -226,7 +226,7 @@ fn unique_path(dir: &Path, filename: &str) -> PathBuf {
         }
     }
 
-    dir.join(&filename)
+    dir.join(format!("{}-{}{}", stem, uuid::Uuid::new_v4(), ext))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

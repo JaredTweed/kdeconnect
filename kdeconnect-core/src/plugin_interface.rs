@@ -8,7 +8,7 @@ use tokio::{
     io::{AsyncRead, AsyncWriteExt},
     sync::{RwLock, mpsc},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     GLOBAL_CONFIG,
@@ -210,8 +210,8 @@ impl PluginRegistry {
                 }
             }
             _ => {
-                warn!(
-                    "[payload] No handler for packet type: {:?}",
+                error!(
+                    "[payload] unsupported payload type: {:?}; payload dropped",
                     packet.packet_type
                 );
                 return;
