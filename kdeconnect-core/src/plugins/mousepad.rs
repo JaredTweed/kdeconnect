@@ -551,6 +551,12 @@ fn handle_ydotool_status(status: ExitStatus, stderr: &[u8]) -> anyhow::Result<()
                 "[mousepad] ydotoold is not running or its socket is unavailable; remote input is unavailable"
             );
         }
+    } else if status.code() == Some(2) && message.is_empty() {
+        if !YDOTOOL_DAEMON_WARNED.swap(true, Ordering::Relaxed) {
+            warn!(
+                "[mousepad] ydotool exited with status 2; ydotoold may not be running (run 'systemctl --user enable --now ydotoold')"
+            );
+        }
     } else if message.is_empty() {
         warn!("[mousepad] ydotool exited with status {}", status);
     } else {

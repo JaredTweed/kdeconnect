@@ -64,7 +64,7 @@ install-ydotoold-service:
     systemctl --user daemon-reload
 
 # Install with systemd service instead of dbus service
-install-systemd: install-bins install-applet-desktop install-systemd-service
+install-systemd: install-bins install-applet-desktop install-systemd-service install-ydotoold-service
     @echo ""
     @echo "✓ KDE Connect installed successfully!"
     @echo ""
@@ -107,7 +107,7 @@ install-debug: install-bins install-applet-desktop install-dbus-service
     @echo "  Restore with: just install"
 
 # Default install — uses D-Bus activation, no systemd required
-install: install-bins install-applet-desktop install-dbus-service install-autostart
+install: install-bins install-applet-desktop install-dbus-service install-autostart install-ydotoold-service
     @echo ""
     @echo "✓ KDE Connect installed successfully!"
     @echo ""
@@ -116,6 +116,9 @@ install: install-bins install-applet-desktop install-dbus-service install-autost
     @echo ""
     @echo "To add the applet:"
     @echo "  COSMIC Settings → Desktop → Panel → Configure Panel Applets → Add KDE Connect"
+    @echo ""
+    @echo "For remote input support (mouse/keyboard/presenter):"
+    @echo "  just enable-remote-input"
 
 # Systemd helpers
 status:
