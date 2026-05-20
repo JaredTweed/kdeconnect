@@ -498,7 +498,6 @@ impl cosmic::Application for KdeConnectApplet {
             &self.devices,
             self.expanded_device.as_ref(),
             Some(&self.pairing_requests),
-            &self.pairing_in_progress,
         )
     }
 
