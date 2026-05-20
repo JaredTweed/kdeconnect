@@ -59,8 +59,6 @@ impl Ping {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{Device, DeviceId};
-    use std::time::Duration;
 
     #[test]
     fn received_packet_returns_immediately_without_blocking() {

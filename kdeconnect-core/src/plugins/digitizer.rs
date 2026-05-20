@@ -405,7 +405,6 @@ fn enable_prop(fd: i32, prop: u16) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn received_packet_returns_immediately() {
