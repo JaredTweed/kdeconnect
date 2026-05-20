@@ -63,6 +63,15 @@ install-ydotoold-service:
     install -Dm644 resources/ydotoold.service {{XDG_CONFIG}}/systemd/user/ydotoold.service
     systemctl --user daemon-reload
 
+# Install udev rule for /dev/uinput permissions (requires sudo)
+install-udev:
+    @echo "Installing udev rule for /dev/uinput (needs sudo)..."
+    sudo install -Dm644 resources/99-uinput.rules /etc/udev/rules.d/99-uinput.rules
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=misc
+    @echo "✓ udev rule installed. /dev/uinput should now be group-writable by 'input'."
+    @echo "  You may need to log out and back in for group membership to take effect."
+
 # Install with systemd service instead of dbus service
 install-systemd: install-bins install-applet-desktop install-systemd-service install-ydotoold-service
     @echo ""
@@ -118,6 +127,7 @@ install: install-bins install-applet-desktop install-dbus-service install-autost
     @echo "  COSMIC Settings → Desktop → Panel → Configure Panel Applets → Add KDE Connect"
     @echo ""
     @echo "For remote input support (mouse/keyboard/presenter):"
+    @echo "  sudo just install-udev"
     @echo "  just enable-remote-input"
 
 # Systemd helpers
