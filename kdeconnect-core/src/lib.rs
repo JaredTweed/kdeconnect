@@ -176,7 +176,6 @@ impl KdeConnectCore {
         plugin_registry.register(Arc::new(sms_plugin)).await;
 
         use protocol::PacketType;
-        
 
         fn parse_vcard(content: &str) -> (Option<String>, Vec<String>) {
             let mut name = None;

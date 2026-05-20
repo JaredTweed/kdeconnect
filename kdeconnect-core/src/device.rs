@@ -536,7 +536,7 @@ mod tests {
         assert_eq!(stored_device.pairing_timestamp, 0);
         assert!(stored_device.remote_certificate.is_empty());
 
-        let loaded = Device::new(
+        let loaded = Device::from_discovery(
             raw_id.to_string(),
             "Loaded Phone".to_string(),
             "phone".to_string(),

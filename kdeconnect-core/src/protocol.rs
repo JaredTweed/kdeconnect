@@ -456,8 +456,12 @@ pub struct Pair {
 
 impl Pair {
     /// Backward-compatible constructor used by upstream callers.
+    #[allow(dead_code)]
     pub fn new(pair: bool) -> Self {
-        Pair { pair, timestamp: None }
+        Pair {
+            pair,
+            timestamp: None,
+        }
     }
 
     pub fn request() -> Self {
