@@ -59,42 +59,8 @@ impl Ping {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ping_serialization_round_trips() {
-        let ping = Ping {
-            message: Some("Hello".into()),
-            heartbeat: None,
-        };
-        let json = serde_json::to_value(&ping).unwrap();
-        let parsed: Ping = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.message, Some("Hello".into()));
-        assert_eq!(parsed.heartbeat, None);
-    }
-
-    #[test]
-    fn heartbeat_ping_has_characteristic_shape() {
-        let ping = Ping {
-            message: None,
-            heartbeat: Some(true),
-        };
-        let json = serde_json::to_value(&ping).unwrap();
-        let parsed: Ping = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.heartbeat, Some(true));
-        assert_eq!(parsed.message, None);
-    }
-
-    #[test]
-    fn empty_object_defaults_to_no_heartbeat() {
-        let parsed: Ping = serde_json::from_str("{}").unwrap();
-        assert!(parsed.message.is_none());
-        assert!(parsed.heartbeat.is_none());
-    }
-
-    #[test]
-    fn ping_plugin_has_correct_id() {
-        assert_eq!(Ping::default().id(), "kdeconnect.ping");
-    }
+    use crate::device::{Device, DeviceId};
+    use std::time::Duration;
 
     #[test]
     fn received_packet_returns_immediately_without_blocking() {

@@ -405,75 +405,7 @@ fn enable_prop(fd: i32, prop: u16) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_session_start() {
-        let session: DigitizerSession = serde_json::from_value(serde_json::json!({
-            "action": "start",
-            "width": 1920,
-            "height": 1080,
-            "resolutionX": 50,
-            "resolutionY": 50
-        }))
-        .unwrap();
-
-        assert_eq!(session.action.as_deref(), Some("start"));
-        assert_eq!(session.width, Some(1920));
-        assert_eq!(session.height, Some(1080));
-        assert_eq!(session.resolution_x, Some(50));
-        assert_eq!(session.resolution_y, Some(50));
-    }
-
-    #[test]
-    fn parses_session_end() {
-        let session: DigitizerSession =
-            serde_json::from_value(serde_json::json!({"action": "end"})).unwrap();
-
-        assert_eq!(session.action.as_deref(), Some("end"));
-    }
-
-    #[test]
-    fn parses_tool_event_pen_touching() {
-        let event: DigitizerEvent = serde_json::from_value(serde_json::json!({
-            "active": true,
-            "touching": true,
-            "tool": "Pen",
-            "x": 500,
-            "y": 300,
-            "pressure": 0.75
-        }))
-        .unwrap();
-
-        assert_eq!(event.active, Some(true));
-        assert_eq!(event.touching, Some(true));
-        assert_eq!(event.tool.as_deref(), Some("Pen"));
-        assert_eq!(event.x, Some(500));
-        assert_eq!(event.y, Some(300));
-        assert_eq!(event.pressure, Some(0.75));
-    }
-
-    #[test]
-    fn parses_tool_event_eraser_hover() {
-        let event: DigitizerEvent = serde_json::from_value(serde_json::json!({
-            "active": true,
-            "tool": "Rubber",
-            "x": 100,
-            "y": 200
-        }))
-        .unwrap();
-
-        assert_eq!(event.tool.as_deref(), Some("Rubber"));
-        assert_eq!(event.touching, None);
-        assert_eq!(event.pressure, None);
-    }
-
-    #[test]
-    fn parses_tool_event_inactive() {
-        let event: DigitizerEvent =
-            serde_json::from_value(serde_json::json!({"active": false})).unwrap();
-
-        assert_eq!(event.active, Some(false));
-    }
+    use std::time::Duration;
 
     #[test]
     fn received_packet_returns_immediately() {

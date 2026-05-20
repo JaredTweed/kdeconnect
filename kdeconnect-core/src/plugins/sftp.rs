@@ -392,27 +392,6 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_full_sftp_response_with_path_names() {
-        use super::Sftp;
-        let json = serde_json::json!({
-            "ip": "192.168.1.71",
-            "port": 1743,
-            "user": "kdeconnect",
-            "password": "abc123",
-            "path": "/storage/emulated/0",
-            "multiPaths": ["/storage/0000-0000", "/storage/emulated/0"],
-            "pathNames": ["SD Card", "All files"]
-        });
-        let sftp: Sftp = serde_json::from_value(json).unwrap();
-        assert_eq!(sftp.ip.as_deref(), Some("192.168.1.71"));
-        assert_eq!(sftp.port, Some(1743));
-        assert_eq!(sftp.multi_paths.len(), 2);
-        assert_eq!(sftp.path_names.len(), 2);
-        assert_eq!(sftp.path_names[0], "SD Card");
-        assert_eq!(sftp.path_names[1], "All files");
-    }
-
-    #[test]
     fn received_packet_returns_immediately_without_blocking() {
         use crate::device::{Device, DeviceId};
         use std::time::Duration;

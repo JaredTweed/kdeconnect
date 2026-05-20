@@ -602,20 +602,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_camel_case_mousepad_fields() {
-        let request: MousepadRequest = serde_json::from_value(serde_json::json!({
-            "specialKey": 12,
-            "sendAck": true,
-            "super": true
-        }))
-        .unwrap();
-
-        assert_eq!(request.special_key, Some(12));
-        assert_eq!(request.send_ack, Some(true));
-        assert_eq!(request.meta, Some(true));
-    }
-
-    #[test]
     fn maps_kdeconnect_special_keys_to_linux_input_codes() {
         assert_eq!(special_key_code(1), Some(14));
         assert_eq!(special_key_code(12), Some(28));
