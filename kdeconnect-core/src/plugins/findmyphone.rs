@@ -26,9 +26,10 @@ pub async fn handle_request(device: &Device) {
     }
 
     tokio::spawn(async move {
-        unmute_audio().await;
+        let was_muted = is_sink_muted().await;
+        unmute_audio(was_muted).await;
         let played = play_alarm().await;
-        remute_audio().await;
+        remute_audio(was_muted).await;
         ALARM_ACTIVE.store(false, Ordering::Release);
 
         if !played {
@@ -75,38 +76,42 @@ async fn play_alarm() -> bool {
     false
 }
 
-async fn unmute_audio() {
-    let was_muted = is_sink_muted().await;
-
-    if was_muted {
-        info!("[findmyphone] unmuting audio for alarm");
-        let _ = Command::new("wpctl")
-            .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "0"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-
-        let _ = Command::new("wpctl")
-            .args(["set-volume", "@DEFAULT_AUDIO_SINK@", "100%"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-
-        let _ = Command::new("pactl")
-            .args(["set-sink-mute", "@DEFAULT_SINK@", "0"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
+async fn unmute_audio(was_muted: bool) {
+    if !was_muted {
+        return;
     }
+
+    info!("[findmyphone] unmuting audio for alarm");
+    let _ = Command::new("wpctl")
+        .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+
+    let _ = Command::new("wpctl")
+        .args(["set-volume", "@DEFAULT_AUDIO_SINK@", "100%"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+
+    let _ = Command::new("pactl")
+        .args(["set-sink-mute", "@DEFAULT_SINK@", "0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
 }
 
-async fn remute_audio() {
+async fn remute_audio(was_muted: bool) {
+    if !was_muted {
+        return;
+    }
+
     info!("[findmyphone] re-muting audio after alarm");
     let _ = Command::new("wpctl")
         .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "1"])

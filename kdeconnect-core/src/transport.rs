@@ -85,7 +85,7 @@ pub(crate) static CONN_METADATA: Lazy<StdMutex<HashMap<DeviceId, ConnMetadata>>>
 
 /// Pop and return the metadata for a device, if present.
 pub(crate) fn take_conn_metadata(id: &DeviceId) -> Option<ConnMetadata> {
-    CONN_METADATA.lock().ok()?.remove(id)
+    CONN_METADATA.lock().ok()?.get(id).cloned()
 }
 
 #[derive(Default)]
@@ -483,7 +483,9 @@ async fn handle_incoming_tcp(
     let conn_id = CONN_COUNTER.fetch_add(1, Ordering::Relaxed);
 
     {
-        let mut meta = CONN_METADATA.lock().expect("CONN_METADATA poisoned");
+        let mut meta = CONN_METADATA
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CONN_METADATA poisoned"))?;
         meta.insert(
             DeviceId(peer_identity.device_id.clone()),
             ConnMetadata {
@@ -813,7 +815,9 @@ async fn handle_discovered_device(
     let conn_id = CONN_COUNTER.fetch_add(1, Ordering::Relaxed);
 
     {
-        let mut meta = CONN_METADATA.lock().expect("CONN_METADATA poisoned");
+        let mut meta = CONN_METADATA
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CONN_METADATA poisoned"))?;
         meta.insert(
             DeviceId(peer_identity.device_id.clone()),
             ConnMetadata {
@@ -1003,20 +1007,6 @@ where
                     if let Ok(mut meta) = CONN_METADATA.lock() {
                         if let Some(data) = meta.get_mut(&id_reader) {
                             data.incoming_conn_id = conn_id;
-                        } else {
-                            meta.insert(
-                                id_reader.clone(),
-                                ConnMetadata {
-                                    device_type: String::new(),
-                                    incoming_capabilities: vec![],
-                                    outgoing_capabilities: vec![],
-                                    protocol_version: 0,
-                                    pairing_timestamp: 0,
-                                    peer_certificate: vec![],
-                                    shutdown_tx: watch::channel(false).0,
-                                    incoming_conn_id: conn_id,
-                                },
-                            );
                         }
                     }
 

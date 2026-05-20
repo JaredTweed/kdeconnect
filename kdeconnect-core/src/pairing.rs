@@ -53,31 +53,20 @@ impl PairingManager {
 
         // Ensure device is known and up to date.
         let existing = self.device_manager.get_device(&id).await;
-        let protocol_version = existing.as_ref().map(|d| d.protocol_version).unwrap_or(0);
-        let pair_state = existing
-            .as_ref()
-            .map(|d| d.pair_state)
-            .unwrap_or(PairState::NotPaired);
-        let remote_certificate = existing
-            .as_ref()
-            .map(|d| d.remote_certificate.clone())
-            .unwrap_or_default();
+        let Some(existing_device) = existing.as_ref() else {
+            warn!("[pairing] ignoring pair request from unknown device {}", id);
+            return Ok(false);
+        };
+        let protocol_version = existing_device.protocol_version;
+        let pair_state = existing_device.pair_state;
+        let remote_certificate = existing_device.remote_certificate.clone();
 
         let mut device = Device::from_discovery(
             id.0.clone(),
             name.clone(),
-            existing
-                .as_ref()
-                .map(|device| device.device_type.clone())
-                .unwrap_or_else(|| "phone".to_string()),
-            existing
-                .as_ref()
-                .map(|device| device.incoming_capabilities.clone())
-                .unwrap_or_default(),
-            existing
-                .as_ref()
-                .map(|device| device.outgoing_capabilities.clone())
-                .unwrap_or_default(),
+            existing_device.device_type.clone(),
+            existing_device.incoming_capabilities.clone(),
+            existing_device.outgoing_capabilities.clone(),
             addr,
         )
         .await?;
@@ -209,6 +198,9 @@ mod tests {
 
         let id = DeviceId("test-device-id-000000000000000000".to_string());
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1716));
+        // Device must be known before processing a pair request.
+        dm.add_or_update_device(id.clone(), Device::default()).await;
+        dm.set_protocol_version(&id, 8).await;
         let packet = ProtocolPacket::new(
             PacketType::Pair,
             json!({
