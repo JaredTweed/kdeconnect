@@ -58,8 +58,22 @@ install-systemd-service:
     install -Dm644 kdeconnect-service/kdeconnect.service {{XDG_CONFIG}}/systemd/user/kdeconnect.service
     systemctl --user daemon-reload
 
+# Install ydotoold user service for remote input
+install-ydotoold-service:
+    install -Dm644 resources/ydotoold.service {{XDG_CONFIG}}/systemd/user/ydotoold.service
+    systemctl --user daemon-reload
+
+# Install udev rule for /dev/uinput permissions (requires sudo)
+install-udev:
+    @echo "Installing udev rule for /dev/uinput (needs sudo)..."
+    sudo install -Dm644 resources/99-uinput.rules /etc/udev/rules.d/99-uinput.rules
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=misc
+    @echo "✓ udev rule installed. /dev/uinput should now be group-writable by 'input'."
+    @echo "  You may need to log out and back in for group membership to take effect."
+
 # Install with systemd service instead of dbus service
-install-systemd: install-bins install-applet-desktop install-systemd-service
+install-systemd: install-bins install-applet-desktop install-systemd-service install-ydotoold-service
     @echo ""
     @echo "✓ KDE Connect installed successfully!"
     @echo ""
@@ -75,6 +89,12 @@ enable-service:
     @echo ""
     @echo "To add the applet:"
     @echo "  COSMIC Settings → Desktop → Panel → Configure Panel Applets → Add KDE Connect"
+
+# Enable and start remote input support
+enable-remote-input:
+    systemctl --user daemon-reload
+    systemctl --user enable --now ydotoold.service
+    @echo "Remote input service now enabled and started"
 
 
 # Debug install — full logging for both service and panel applet
@@ -96,7 +116,7 @@ install-debug: install-bins install-applet-desktop install-dbus-service
     @echo "  Restore with: just install"
 
 # Default install — uses D-Bus activation, no systemd required
-install: install-bins install-applet-desktop install-dbus-service install-autostart
+install: install-bins install-applet-desktop install-dbus-service install-autostart install-ydotoold-service
     @echo ""
     @echo "✓ KDE Connect installed successfully!"
     @echo ""
@@ -105,6 +125,10 @@ install: install-bins install-applet-desktop install-dbus-service install-autost
     @echo ""
     @echo "To add the applet:"
     @echo "  COSMIC Settings → Desktop → Panel → Configure Panel Applets → Add KDE Connect"
+    @echo ""
+    @echo "For remote input support (mouse/keyboard/presenter):"
+    @echo "  sudo just install-udev"
+    @echo "  just enable-remote-input"
 
 # Systemd helpers
 status:
@@ -117,7 +141,21 @@ stop:
     systemctl --user stop kdeconnect.service
 
 restart:
-    systemctl --user restart kdeconnect.service
+    @if systemctl --user --quiet is-active kdeconnect.service; then \
+        systemctl --user restart kdeconnect.service; \
+    else \
+        for pid in $(pgrep -f 'kdeconnect-service' || true); do \
+            exe=$(readlink -f /proc/$pid/exe 2>/dev/null || true); \
+            case "$exe" in */kdeconnect-service|*/kdeconnect-service\ \(deleted\)) kill "$pid" 2>/dev/null || true ;; esac; \
+        done; \
+    fi
+    @for pid in $(pgrep -f 'cosmic-ext-connect-applet' || true); do \
+        exe=$(readlink -f /proc/$pid/exe 2>/dev/null || true); \
+        case "$exe" in */cosmic-ext-connect-applet|*/cosmic-ext-connect-applet\ \(deleted\)) kill "$pid" 2>/dev/null || true ;; esac; \
+    done
+    @sleep 2
+    @busctl --user call {{APPID}} /io/github/hepp3n/kdeconnect/Daemon {{APPID}}.Daemon BroadcastIdentity >/dev/null 2>&1 || true
+    @pkill cosmic-panel || true
 
 clean:
     cargo clean
@@ -126,12 +164,15 @@ clean:
 uninstall:
     -systemctl --user stop kdeconnect.service 2>/dev/null || true
     -systemctl --user disable kdeconnect.service 2>/dev/null || true
+    -systemctl --user stop ydotoold.service 2>/dev/null || true
+    -systemctl --user disable ydotoold.service 2>/dev/null || true
     rm -vf {{PREFIX}}/bin/kdeconnect-service
     rm -vf {{PREFIX}}/bin/cosmic-ext-connect-applet
     rm -vf {{PREFIX}}/bin/cosmic-ext-connect-settings
     rm -vf {{PREFIX}}/bin/cosmic-ext-connect-sms
     rm -vf {{XDG_CONFIG}}/kdeconnect/*
     rm -vf {{XDG_CONFIG}}/systemd/user/kdeconnect.service
+    rm -vf {{XDG_CONFIG}}/systemd/user/ydotoold.service
     rm -vf {{XDG_CONFIG}}/autostart/{{APPID}}.daemon.desktop
     rm -rvf {{PREFIX}}/share/kdeconnect/*
     rm -vf {{PREFIX}}/share/applications/{{APPID}}.desktop
