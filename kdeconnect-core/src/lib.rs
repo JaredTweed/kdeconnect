@@ -1,37 +1,43 @@
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 use tokio::{
     select,
     sync::{Mutex, mpsc},
+    time::MissedTickBehavior,
 };
-use tracing::{debug, info};
+// Used in test code — keep so cargo fix doesn't remove them
+#[cfg_attr(not(test), allow(unused_imports))]
+use crate::protocol::Pair;
+#[cfg_attr(not(test), allow(unused_imports))]
+use tokio::sync::watch;
+use tracing::{debug, error, info, warn};
 
 use crate::{
-    device::{Device, DeviceId, DeviceManager},
+    core::connection::{ConnectionHandle, UnpairedResyncLimiter},
+    device::{Device, DeviceId, DeviceManager, PairState},
     event::{AppEvent, ConnectionEvent, CoreEvent},
-    filetransfer::TransferAdapter,
     pairing::PairingManager,
     plugin_interface::PluginRegistry,
-    plugins::{ping::Ping, share::ShareRequest},
-    protocol::{DeviceFile, DevicePayload, Pair},
     transport::{ConnectionRateLimiter, TcpTransport, TransportEvent, UdpTransport},
 };
 
+pub(crate) mod core;
+
 pub mod config;
-pub mod plugin_config;
 pub(crate) mod crypto;
 pub mod device;
 pub mod event;
 pub mod filetransfer;
 pub(crate) mod pairing;
+pub mod plugin_config;
 pub(crate) mod plugin_interface;
 pub mod plugins;
 pub(crate) mod protocol;
 pub(crate) mod transport;
 
-// Re-export commonly used protocol types for external crates
 pub use protocol::{PacketType, ProtocolPacket};
 
 pub static GLOBAL_CONFIG: OnceLock<config::Config> = OnceLock::new();
@@ -45,11 +51,10 @@ pub struct KdeConnectCore {
     pairing: Arc<PairingManager>,
     plugin_registry: Arc<PluginRegistry>,
     transport_rx: mpsc::UnboundedReceiver<TransportEvent>,
-    writer_map: Arc<Mutex<HashMap<DeviceId, mpsc::UnboundedSender<ProtocolPacket>>>>,
-    /// Tracks the conn_id of the most recently accepted connection per device.
-    /// A `Disconnected` event whose conn_id doesn't match is from a superseded
-    /// connection and is discarded so it cannot wipe a live writer_map entry.
+    writer_map: Arc<Mutex<HashMap<DeviceId, ConnectionHandle>>>,
     conn_id_map: Arc<Mutex<HashMap<DeviceId, u64>>>,
+    pairing_attempts: Arc<Mutex<HashMap<DeviceId, u64>>>,
+    unpaired_resync_limiter: Arc<UnpairedResyncLimiter>,
     event_tx: mpsc::UnboundedSender<CoreEvent>,
     event_rx: mpsc::UnboundedReceiver<CoreEvent>,
     udp_transport: Arc<UdpTransport>,
@@ -57,7 +62,6 @@ pub struct KdeConnectCore {
     in_rx: mpsc::UnboundedReceiver<AppEvent>,
     conn_tx: mpsc::UnboundedSender<ConnectionEvent>,
     mpris_conn_tx: mpsc::UnboundedSender<ConnectionEvent>,
-    pending_pair: Arc<Mutex<std::collections::HashSet<DeviceId>>>,
 }
 
 impl KdeConnectCore {
@@ -79,6 +83,8 @@ impl KdeConnectCore {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let writer_map = Arc::new(Mutex::new(HashMap::new()));
         let conn_id_map = Arc::new(Mutex::new(HashMap::new()));
+        let pairing_attempts = Arc::new(Mutex::new(HashMap::new()));
+        let unpaired_resync_limiter = Arc::new(UnpairedResyncLimiter::default());
 
         let device_manager = DeviceManager::new(event_tx.clone());
         let pairing = Arc::new(PairingManager::new(device_manager.clone()));
@@ -96,7 +102,69 @@ impl KdeConnectCore {
 
         let udp = Arc::clone(&udp_transport);
         tokio::spawn(async move {
-            let _ = udp.listen().await;
+            if let Err(e) = udp.listen().await {
+                error!("UDP listener failed: {}", e);
+            }
+        });
+
+        if let Some(config_dir) = dirs::config_dir() {
+            let kc_dir = config_dir.join(config::CONFIG_DIR);
+            if let Ok(mut entries) = tokio::fs::read_dir(&kc_dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("ron") {
+                        match tokio::fs::read_to_string(&path).await {
+                            Ok(raw) => {
+                                if let Ok(dev) = ron::de::from_str::<Device>(&raw)
+                                    && dev.pair_state == PairState::Paired
+                                {
+                                    info!("Loaded paired device from disk: {}", dev.device_id);
+                                    device_manager
+                                        .add_or_update_device(dev.device_id.clone(), dev)
+                                        .await;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to read persisted device file: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let udp_broadcast = Arc::clone(&udp_transport);
+        tokio::spawn(async move {
+            if let Err(e) = udp_broadcast.send_identity().await {
+                warn!("[core] initial identity broadcast failed: {}", e);
+            }
+        });
+
+        let reconnect_udp = Arc::clone(&udp_transport);
+        let reconnect_dm = device_manager.clone();
+        let reconnect_wm = Arc::clone(&writer_map);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let has_disconnected_paired = {
+                    let devices = reconnect_dm.get_devices().await;
+                    let writers = reconnect_wm.lock().await;
+                    devices.iter().any(|d| {
+                        d.pair_state == PairState::Paired && !writers.contains_key(&d.device_id)
+                    })
+                };
+                if has_disconnected_paired {
+                    debug!(
+                        "Reconnect timer: broadcasting identity for disconnected paired devices"
+                    );
+                    if let Err(e) = reconnect_udp.send_identity().await {
+                        error!("Reconnect broadcast failed: {}", e);
+                    }
+                }
+            }
         });
 
         let run_command_plugin = plugins::run_command::RunCommandRequest::default();
@@ -112,6 +180,489 @@ impl KdeConnectCore {
         };
         plugin_registry.register(Arc::new(sms_plugin)).await;
 
+        use protocol::PacketType;
+
+        fn parse_vcard(content: &str) -> (Option<String>, Vec<String>) {
+            let mut name = None;
+            let mut phones = vec![];
+            for line in content.lines() {
+                let line = line.trim();
+                if let Some(s) = line.strip_prefix("FN:") {
+                    name = Some(s.trim().to_string());
+                } else if name.is_none() && line.starts_with("N:") {
+                    let p: Vec<&str> = line[2..].split(';').collect();
+                    if p.len() >= 2 {
+                        let f = format!("{} {}", p[1].trim(), p[0].trim())
+                            .trim()
+                            .to_string();
+                        if !f.is_empty() {
+                            name = Some(f);
+                        }
+                    }
+                } else if line.starts_with("TEL")
+                    && let Some(pos) = line.rfind(':')
+                {
+                    let ph = line[pos + 1..].trim().to_string();
+                    if !ph.is_empty() {
+                        phones.push(ph);
+                    }
+                }
+            }
+            (name, phones)
+        }
+
+        plugin_registry
+            .register_handler(
+                PacketType::Battery,
+                Arc::new(|device, body, _ct, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(battery) =
+                            serde_json::from_value::<plugins::battery::Battery>(body)
+                        {
+                            battery
+                                .received_packet(device.device_id.clone(), conn_tx)
+                                .await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::BatteryRequest,
+                Arc::new(|device, _body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        plugins::battery::send_local_state(device.device_id.clone(), core_tx).await;
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Clipboard,
+                Arc::new(|_d, body, _ct, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(cb) =
+                            serde_json::from_value::<plugins::clipboard::Clipboard>(body)
+                        {
+                            cb.received_packet(conn_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::ClipboardConnect,
+                Arc::new(|_d, body, _ct, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(cb) =
+                            serde_json::from_value::<plugins::clipboard::Clipboard>(body)
+                        {
+                            if let Some(ts) = cb.timestamp {
+                                debug!("Clipboard sync on connect accepted (ts={})", ts);
+                            }
+                            cb.received_packet(conn_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::ConnectivityReport,
+                Arc::new(|device, body, _ct, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(rep) = serde_json::from_value::<
+                            plugins::connectivity_report::ConnectivityReport,
+                        >(body)
+                        {
+                            rep.received_packet(device.device_id.clone(), conn_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry.register_handler(PacketType::ConnectivityReportRequest, Arc::new(|_d, _b, _ct, _conn, _mt, _pi| Box::pin(async move {
+            debug!("ConnectivityReportRequest received — desktop has no cellular modem state");
+        }))).await;
+        plugin_registry
+            .register_handler(
+                PacketType::ContactsResponseUidsTimestamps,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Some(arr) = body.get("uids").and_then(|v| v.as_array()) {
+                            let uids: Vec<String> = arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect();
+                            if !uids.is_empty() {
+                                let pkt = ProtocolPacket::new(
+                                    PacketType::ContactsRequestVcardsByUid,
+                                    serde_json::json!({"uids": uids}),
+                                );
+                                let _ = core_tx.send(CoreEvent::SendPacket {
+                                    device: device.device_id.clone(),
+                                    packet: pkt,
+                                });
+                            }
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::ContactsResponseVcards,
+                Arc::new(|device, body, _ct, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        let mut contacts: std::collections::HashMap<String, String> =
+                            std::collections::HashMap::new();
+                        if let Some(arr) = body.get("uids").and_then(|v| v.as_array()) {
+                            for uid_val in arr {
+                                if let Some(uid) = uid_val.as_str()
+                                    && let Some(vcard) = body.get(uid).and_then(|v| v.as_str())
+                                {
+                                    let (n, ps) = parse_vcard(vcard);
+                                    if let Some(name) = n {
+                                        for phone in ps {
+                                            contacts.insert(phone, name.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !contacts.is_empty() {
+                            let _ = conn_tx.send(ConnectionEvent::ContactsReceived(
+                                device.device_id.clone(),
+                                contacts,
+                            ));
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::FindMyPhoneRequest,
+                Arc::new(|device, _b, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        plugins::findmyphone::handle_request(&device).await;
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Mpris,
+                Arc::new(|device, body, _ct, conn_tx, mpris_tx, _pi| {
+                    Box::pin(async move {
+                        if let Ok(pkt) = serde_json::from_value::<plugins::mpris::Mpris>(body) {
+                            let ev = ConnectionEvent::Mpris((device.device_id.clone(), pkt));
+                            let _ = conn_tx.send(ev.clone());
+                            let _ = mpris_tx.send(ev);
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::MprisRequest,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(req) =
+                            serde_json::from_value::<plugins::mpris::MprisRequest>(body)
+                        {
+                            req.received_packet(&device, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::MousePadKeyboardState,
+                Arc::new(|_d, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(ks) =
+                            serde_json::from_value::<plugins::mousepad::KeyboardState>(body)
+                        {
+                            debug!("{:?}", ks);
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::MousePadEcho,
+                Arc::new(|_d, _b, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        debug!("MousePadEcho received");
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::MousePadRequest,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(req) =
+                            serde_json::from_value::<plugins::mousepad::MousepadRequest>(body)
+                        {
+                            req.received_packet(&device, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Presenter,
+                Arc::new(|_d, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(req) =
+                            serde_json::from_value::<plugins::mousepad::PresenterRequest>(body)
+                        {
+                            req.received_packet().await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Notification,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(n) =
+                            serde_json::from_value::<plugins::notification::Notification>(body)
+                        {
+                            n.received_packet(&device, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::NotificationRequest,
+                Arc::new(|_d, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(req) = serde_json::from_value::<
+                            plugins::notification::NotificationRequest,
+                        >(body)
+                        {
+                            req.received_packet().await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Ping,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(ping) = serde_json::from_value::<plugins::ping::Ping>(body) {
+                            ping.received_packet(&device, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::RunCommand,
+                Arc::new(|device, body, core_tx, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(rc) =
+                            serde_json::from_value::<plugins::run_command::RunCommand>(body)
+                        {
+                            rc.received_packet(&device, conn_tx, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::RunCommandRequest,
+                Arc::new(|device, body, core_tx, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(rcr) =
+                            serde_json::from_value::<plugins::run_command::RunCommandRequest>(body)
+                        {
+                            rcr.received_packet(&device, conn_tx, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Sftp,
+                Arc::new(|device, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(pkt) = serde_json::from_value::<plugins::sftp::Sftp>(body) {
+                            pkt.received_packet(&device).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::ShareRequest,
+                Arc::new(|device, body, _ct, _conn, _mt, payload_info| {
+                    Box::pin(async move {
+                        if let Ok(sr) = serde_json::from_value::<plugins::share::ShareRequest>(body)
+                        {
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    sr.receive_share(&device, payload_info.as_ref()).await
+                                {
+                                    warn!("[share] receive_share failed: {}", e);
+                                }
+                            });
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::ShareRequestUpdate,
+                Arc::new(|_d, _body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        debug!("ShareRequestUpdate received (progress update from phone)");
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::SmsMessages,
+                Arc::new(|device, body, _ct, conn_tx, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(sms) = serde_json::from_value::<plugins::sms::SmsMessages>(body) {
+                            info!(
+                                "Received SMS messages packet with {} messages",
+                                sms.messages.len()
+                            );
+                            sms.received_packet(device.device_id.0.clone(), conn_tx)
+                                .await;
+                        } else {
+                            warn!("Failed to parse SMS messages packet");
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::SmsAttachmentFile,
+                Arc::new(|_d, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        debug!(
+                            "SmsAttachmentFile received: {:?}",
+                            body.get("filename").and_then(|v| v.as_str())
+                        );
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::SystemVolumeRequest,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(req) = serde_json::from_value::<
+                            plugins::systemvolume::SystemVolumeRequest,
+                        >(body)
+                        {
+                            req.handle(&device, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Telephony,
+                Arc::new(|device, body, core_tx, _ct, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(pkt) =
+                            serde_json::from_value::<plugins::telephony::TelephonyPacket>(body)
+                        {
+                            pkt.received_packet(&device, core_tx).await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::TelephonyRequestMute,
+                Arc::new(|_d, _b, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        debug!("TelephonyRequestMute received — no action needed on desktop");
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Lock,
+                Arc::new(|device, _body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        info!("Phone {} requested desktop lock", device.name);
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::LockRequest,
+                Arc::new(|_d, _body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        debug!("LockRequest received");
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::DigitizerSession,
+                Arc::new(|_d, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(s) =
+                            serde_json::from_value::<plugins::digitizer::DigitizerSession>(body)
+                        {
+                            s.received_packet().await;
+                        }
+                    })
+                }),
+            )
+            .await;
+        plugin_registry
+            .register_handler(
+                PacketType::Digitizer,
+                Arc::new(|_d, body, _ct, _conn, _mt, _pi| {
+                    Box::pin(async move {
+                        if let Ok(e) =
+                            serde_json::from_value::<plugins::digitizer::DigitizerEvent>(body)
+                        {
+                            e.received_packet().await;
+                        }
+                    })
+                }),
+            )
+            .await;
+
+        plugins::mpris::init_telephony_signal();
         plugins::mpris::expose_phone_mpris(mpris_conn_rx, event_tx.clone());
 
         Ok((
@@ -122,6 +673,8 @@ impl KdeConnectCore {
                 transport_rx,
                 writer_map,
                 conn_id_map,
+                pairing_attempts,
+                unpaired_resync_limiter,
                 event_tx,
                 event_rx,
                 udp_transport,
@@ -129,27 +682,20 @@ impl KdeConnectCore {
                 in_rx,
                 conn_tx,
                 mpris_conn_tx,
-                pending_pair: Arc::new(Mutex::new(std::collections::HashSet::new())),
             },
             conn_rx,
         ))
     }
 
     pub async fn run_event_loop(&mut self) {
-        info!("Starting KdeConnect event loop");
-
-        plugins::mpris::monitor_mpris(
-            (*self.device_manager).clone(),
-            self.event_tx.clone(),
-        );
-
         loop {
             select! {
-                maybe = self.event_rx.recv() => {
-                    match maybe {
+                maybe_event = self.event_rx.recv() => {
+                    match maybe_event {
                         Some(event) => self.core_events(event).await,
                         None => {
-                            let _ = self.event_tx.send(CoreEvent::Error("CoreEvent channel closed".to_string()));
+                            error!("CoreEvent channel closed — aborting event loop");
+                            break;
                         }
                     }
                 }
@@ -157,7 +703,8 @@ impl KdeConnectCore {
                     match maybe_event {
                         Some(event) => self.transport_events(event).await,
                         None => {
-                            let _ = self.event_tx.send(CoreEvent::Error("Transport channel closed".to_string()));
+                            error!("Transport channel closed — aborting event loop");
+                            break;
                         }
                     }
                 }
@@ -165,520 +712,368 @@ impl KdeConnectCore {
                     match maybe_kde {
                         Some(event) => self.kde_events(event).await,
                         None => {
-                            let _ = self.event_tx.send(CoreEvent::Error("KdeEvent channel closed".to_string()));
+                            error!("KdeEvent channel closed — aborting event loop");
+                            break;
                         }
                     }
                 }
             }
         }
-    }
-
-    async fn core_events(&self, event: CoreEvent) {
-        let guard = self.writer_map.lock().await;
-
-        match event {
-            CoreEvent::PacketReceived { device, packet } => {
-                info!("[core] packet received from device: {}", device);
-                if let Some(device_obj) = self.device_manager.get_device(&device).await {
-                    self.plugin_registry
-                        .dispatch(
-                            device_obj,
-                            packet,
-                            self.event_tx.clone(),
-                            self.conn_tx.clone(),
-                            self.mpris_conn_tx.clone(),
-                        )
-                        .await;
-                }
-            }
-            CoreEvent::DeviceDiscovered(_device) => {
-                debug!("[core] device discovered.");
-            }
-            CoreEvent::DevicePaired((device_id, device)) => {
-                info!("[core] device paired: {}", device_id);
-
-                if self
-                    .plugin_registry
-                    .is_plugin_enabled(&device_id.0, "contacts")
-                    .await
-                {
-                    if let Some(sender) = guard.get(&device_id) {
-                        let contacts_pkt = ProtocolPacket::new(
-                            PacketType::ContactsRequestAllUidsTimestamps,
-                            serde_json::json!({}),
-                        );
-                        let _ = sender.send(contacts_pkt);
-                    }
-                }
-
-                // Bootstrap MPRIS: request the phone's player list so
-                // expose_phone_mpris can register D-Bus proxies for them.
-                if self
-                    .plugin_registry
-                    .is_plugin_enabled(&device_id.0, "mpris")
-                    .await
-                {
-                    if let Some(sender) = guard.get(&device_id) {
-                        let mpris_pkt = ProtocolPacket::new(
-                            PacketType::MprisRequest,
-                            serde_json::to_value(
-                                crate::plugins::mpris::MprisRequest {
-                                    request_player_list: Some(true),
-                                    ..Default::default()
-                                }
-                            ).unwrap(),
-                        );
-                        let _ = sender.send(mpris_pkt);
-                    }
-                }
-
-                let conn_event = ConnectionEvent::DevicePaired((device_id, device));
-                let _ = self.conn_tx.send(conn_event.clone());
-                let _ = self.mpris_conn_tx.send(conn_event);
-            }
-            CoreEvent::DevicePairCancelled(device_id) => {
-                info!("[core] device pair cancelled.");
-                let conn_event = ConnectionEvent::PairStateChanged((
-                    device_id,
-                    crate::device::PairState::NotPaired,
-                ));
-                let _ = self.conn_tx.send(conn_event.clone());
-                let _ = self.mpris_conn_tx.send(conn_event);
-            }
-            CoreEvent::DevicePairStateChanged((device_id, pair_state)) => {
-                let conn_event = ConnectionEvent::PairStateChanged((device_id, pair_state));
-                let _ = self.conn_tx.send(conn_event.clone());
-                let _ = self.mpris_conn_tx.send(conn_event);
-            }
-            CoreEvent::SendPacket { device, packet } => {
-                info!("[core] sending packet");
-                if let Some(sender) = guard.get(&device) {
-                    sender.send(packet).unwrap();
-                }
-            }
-            CoreEvent::SendPaylod {
-                device,
-                packet,
-                payload,
-                payload_size,
-            } => {
-                info!("[core] sending packet w/ payload");
-
-                // crate transfer adapter to get file transfer progress
-                let transfer_adapter =
-                    TransferAdapter::new(payload, payload_size, self.conn_tx.clone());
-
-                if let Some(sender) = guard.get(&device) {
-                    self.plugin_registry
-                        .send_payload(packet, sender, transfer_adapter, payload_size)
-                        .await;
-                }
-            }
-            CoreEvent::Error(msg) => {
-                tracing::error!("{}", msg);
-            }
-        };
-    }
-
-    async fn transport_events(&self, event: TransportEvent) {
-        match event {
-            TransportEvent::NewConnection {
-                addr,
-                id,
-                name,
-                write_tx,
-                conn_id,
-            } => {
-                debug!("[core] new connection from: {}", addr);
-
-                let device = Device::new(id.0.clone(), name, addr)
-                    .await
-                    .expect("cannot create new device from metadata");
-
-                self.device_manager
-                    .add_or_update_device(id.clone(), device.clone())
-                    .await;
-
-                // Record this connection's ID before inserting the writer so that
-                // any Disconnected event from a previous connection that arrives
-                // concurrently will see a mismatched conn_id and be dropped.
-                self.conn_id_map.lock().await.insert(id.clone(), conn_id);
-
-                // Always replace — the phone reconnecting means the old connection
-                // is intentionally superseded. Dropping the old write_tx here causes
-                // the old writer task's recv() to return None, ending that task cleanly.
-                self.writer_map.lock().await.insert(id.clone(), write_tx);
-
-                self.pending_pair.lock().await.remove(&id);
-
-                if device.pair_state == crate::device::PairState::Paired {
-                    let guard = self.writer_map.lock().await;
-                    if let Some(sender) = guard.get(&id) {
-                        let contacts_pkt = ProtocolPacket::new(
-                            PacketType::ContactsRequestAllUidsTimestamps,
-                            serde_json::json!({}),
-                        );
-                        let _ = sender.send(contacts_pkt);
-                    }
-                    drop(guard);
-                    // Send our local command list so the Android app shows
-                    // the Run Command option (requires canAddCommand: true).
-                    plugins::run_command::send_command_list(&id, self.event_tx.clone()).await;
-                    
-                    if self.plugin_registry.is_plugin_enabled(&id.0, "systemvolume").await {
-                        plugins::systemvolume::on_device_connect(id.clone(), self.event_tx.clone());
-                    }
-                }
-
-                let conn_event = ConnectionEvent::Connected((id.clone(), device.clone()));
-                let _ = self.conn_tx.send(conn_event.clone());
-                let _ = self.mpris_conn_tx.send(conn_event);
-            }
-            TransportEvent::IncomingPacket { addr, id, raw } => {
-                info!("[core] incoming packet.");
-                match serde_json::from_str::<ProtocolPacket>(&raw) {
-                    Ok(pkt) => {
-                        if let PacketType::Pair = pkt.packet_type {
-                            if let Ok(pair_body) = serde_json::from_value::<Pair>(pkt.body.clone())
-                                && let Some(device) = self.device_manager.get_device(&id).await
-                            {
-                                if !pair_body.pair {
-                                    // Phone sent pair:false — either it's unpairing from us, or
-                                    // it's a fresh device announcing it doesn't know us yet.
-                                    // Only clean up and notify if we considered it paired; fresh
-                                    // discovery announcements should be ignored silently so the
-                                    // user can still initiate pairing normally from the settings app.
-                                    self.pending_pair.lock().await.remove(&id);
-                                    if device.pair_state == crate::device::PairState::Paired {
-                                        info!("[core] Phone unpairing from us — cleaning up {}", id);
-                                        self.device_manager
-                                            .update_pair_state(&id, crate::device::PairState::NotPaired)
-                                            .await;
-                                        cleanup_device_data(&id.0).await;
-                                        let conn_event = ConnectionEvent::PairStateChanged((
-                                            id.clone(),
-                                            crate::device::PairState::NotPaired,
-                                        ));
-                                        let _ = self.conn_tx.send(conn_event.clone());
-                                        let _ = self.mpris_conn_tx.send(conn_event);
-                                    } else {
-                                        info!("[core] pair:false from {} — device not paired, ignoring", id);
-                                    }
-                                } else {
-                                    let device_name = device.name.clone();
-                                    let device_id_clone = id.clone();
-                                    let is_new_request = self
-                                        .pairing
-                                        .handle_pair_request(
-                                            device.device_id,
-                                            device.name,
-                                            device.address,
-                                            pkt,
-                                        )
-                                        .await
-                                        .unwrap_or(false);
-                                    if is_new_request {
-                                        let ev = ConnectionEvent::PairingRequested((
-                                            device_id_clone,
-                                            device_name,
-                                        ));
-                                        let _ = self.conn_tx.send(ev.clone());
-                                        let _ = self.mpris_conn_tx.send(ev);
-                                    }
-                                }
-                            }
-                        } else {
-                            let _ = self.event_tx.send(CoreEvent::PacketReceived {
-                                device: id.clone(),
-                                packet: pkt.clone(),
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        let _ = self.event_tx.send(CoreEvent::Error(format!(
-                            "Invalid packet from {}: {}",
-                            addr, e
-                        )));
-                    }
-                }
-            }
-            TransportEvent::Disconnected { id, conn_id } => {
-                // Check whether this disconnect belongs to the connection that is
-                // currently live for this device. If conn_id_map holds a *different*
-                // (higher) ID, a newer connection has already taken over and this
-                // event is stale — dropping it avoids wiping the live writer entry.
-                let is_current = {
-                    let guard = self.conn_id_map.lock().await;
-                    guard
-                        .get(&id)
-                        .map(|&current| current == conn_id)
-                        // No entry means we never registered this connection (e.g. a
-                        // Disconnected that raced ahead of its NewConnection). Treat as
-                        // current so cleanup still runs if the writer entry somehow exists.
-                        .unwrap_or(true)
-                };
-
-                if !is_current {
-                    info!(
-                        "[core] stale Disconnected for {} (conn_id {} != current) — ignoring",
-                        id, conn_id
-                    );
-                    return;
-                }
-
-                self.writer_map.lock().await.remove(&id);
-                self.conn_id_map.lock().await.remove(&id);
-                info!("[core] removed dead connection for {}", id);
-                let conn_event = ConnectionEvent::Disconnected(id);
-                let _ = self.conn_tx.send(conn_event.clone());
-                let _ = self.mpris_conn_tx.send(conn_event);
-            }
-            TransportEvent::PairTrustFailed { id, .. }
-            | TransportEvent::PacketSendFailed { id, .. } => {
-                debug!("[core] transport reported connection failure for {}", id);
-            }
-        }
-    }
-
-    async fn kde_events(&self, event: AppEvent) {
-        let mut guard = self.writer_map.lock().await;
-
-        match event {
-            AppEvent::Broadcasting => {
-                let _ = self.udp_transport.send_identity().await;
-            }
-            AppEvent::Pair(device_id) => {
-                info!("frontend sent pair event to device: {}", device_id);
-                if let Some(sender) = guard.get(&device_id) {
-                    let pair = Pair::new(true);
-                    let value = serde_json::to_value(pair).expect("fail serializing pair");
-                    let pkt = ProtocolPacket::new(PacketType::Pair, value);
-                    let _ = sender.send(pkt);
-                    info!("Sent pair request packet to device: {}", device_id);
-                }
-                self.device_manager
-                    .update_pair_state(&device_id, crate::device::PairState::Requesting)
-                    .await;
-            }
-            AppEvent::Ping((device_id, msg)) => {
-                info!("frontend sent ping event to device: {}", device_id);
-                let value = serde_json::to_value(Ping { message: Some(msg) })
-                    .expect("fail serializing packet body");
-                let pkt = ProtocolPacket::new(PacketType::Ping, value);
-                if let Some(device) = self.device_manager.get_device(&device_id).await {
-                    self.plugin_registry
-                        .send(device.clone(), pkt, self.event_tx.clone())
-                        .await;
-                };
-            }
-            AppEvent::SendPacket(device_id, packet) => {
-                info!("Sending packet to device: {}", device_id);
-                if let Some(sender) = guard.get(&device_id) {
-                    let _ = sender.send(packet);
-                } else {
-                    debug!(
-                        "No sender for device {} — available: {:?}",
-                        device_id,
-                        guard.keys().collect::<Vec<_>>()
-                    );
-                }
-            }
-            AppEvent::SendFiles((device_id, files_list)) => {
-                info!("frontend trying to sent files to device: {}", device_id);
-
-                // Clone the sender and drop the lock immediately — send_payload
-                // spawns a background task that can take seconds, and holding
-                // the writer_map lock that whole time would stall the event loop.
-                let sender = guard.get(&device_id).cloned();
-                drop(guard);
-
-                if let Some(sender) = sender {
-                    debug!("sender available.");
-                    let pkts = ShareRequest::share_files(files_list)
-                        .await
-                        .expect("creating share request");
-                    for (pkt_body, path) in pkts {
-                        let packet = ProtocolPacket::new(
-                            PacketType::ShareRequest,
-                            serde_json::to_value(pkt_body).expect("serializing packet body"),
-                        );
-                        let file = DeviceFile::open(path).await.expect("opening file");
-                        let payload = DevicePayload::from(file);
-                        //
-                        // crate transfer adapter to get file transfer progress
-                        let transfer_adapter =
-                            TransferAdapter::new(payload.buf, payload.size, self.conn_tx.clone());
-
-                        self.plugin_registry
-                            .send_payload(packet, &sender, transfer_adapter, payload.size)
-                            .await;
-                    }
-
-                    debug!("file transfer tasks spawned.");
-                }
-                // guard already dropped above — skip the implicit drop at end of match
-                return;
-            }
-            AppEvent::MprisAction((device_id, player_name, action)) => {
-                info!(
-                    "frontend sent mpris action to device: {} player: {}",
-                    device_id, player_name
-                );
-                let request = crate::plugins::mpris::MprisRequest {
-                    player: Some(player_name),
-                    request_now_playing: None,
-                    request_player_list: None,
-                    request_volume: None,
-                    seek: None,
-                    set_loop_status: None,
-                    set_position: None,
-                    set_shuffle: None,
-                    set_volume: None,
-                    action: Some(action),
-                    album_art_url: None,
-                };
-                let value = serde_json::to_value(request).expect("fail serializing packet body");
-                let pkt = ProtocolPacket::new(PacketType::MprisRequest, value);
-                if let Some(device) = self.device_manager.get_device(&device_id).await {
-                    self.plugin_registry
-                        .send(device.clone(), pkt, self.event_tx.clone())
-                        .await;
-                };
-            }
-            AppEvent::SendMprisRequest((device_id, request)) => {
-                info!("frontend sent mpris request to device: {}", device_id);
-                let value = serde_json::to_value(request).expect("fail serializing packet body");
-                let pkt = ProtocolPacket::new(PacketType::MprisRequest, value);
-                if let Some(device) = self.device_manager.get_device(&device_id).await {
-                    self.plugin_registry
-                        .send(device.clone(), pkt, self.event_tx.clone())
-                        .await;
-                };
-            }
-            AppEvent::Unpair(device_id) => {
-                info!("frontend sent unpair event to device: {}", device_id);
-
-                // Send pair:false to the phone so it knows we've unpaired.
-                if let Some(sender) = guard.get(&device_id) {
-                    let pair = Pair::new(false);
-                    let value = serde_json::to_value(pair).expect("fail serializing pair");
-                    let pkt = ProtocolPacket::new(PacketType::Pair, value);
-                    let _ = sender.send(pkt);
-                    info!("[core] sent pair:false to {} on unpair", device_id);
-                }
-                drop(guard);
-
-                let _ = self.pairing.cancel_pairing(device_id.clone()).await;
-                cleanup_device_data(&device_id.0).await;
-
-                let conn_event = ConnectionEvent::PairStateChanged((
-                    device_id,
-                    crate::device::PairState::NotPaired,
-                ));
-                let _ = self.conn_tx.send(conn_event.clone());
-                let _ = self.mpris_conn_tx.send(conn_event);
-                return;
-            }
-            AppEvent::AcceptPairing(device_id) => {
-                info!("User accepted pairing from {}", device_id);
-                // Send pair:true to the phone — it is waiting for our response.
-                if let Some(sender) = guard.get(&device_id) {
-                    let pair = Pair::new(true);
-                    let value = serde_json::to_value(pair).expect("fail serializing pair");
-                    let pkt = ProtocolPacket::new(PacketType::Pair, value);
-                    let _ = sender.send(pkt);
-                    info!("[core] sent pair:true to {} on accept", device_id);
-                }
-                self.device_manager.set_paired(&device_id, true).await;
-            }
-            AppEvent::RejectPairing(device_id) => {
-                info!("User rejected pairing from {}", device_id);
-                // Send pair:false to the phone so it knows we declined.
-                if let Some(sender) = guard.get(&device_id) {
-                    let pair = Pair::new(false);
-                    let value = serde_json::to_value(pair).expect("fail serializing pair");
-                    let pkt = ProtocolPacket::new(PacketType::Pair, value);
-                    let _ = sender.send(pkt);
-                    info!("[core] sent pair:false to {} on reject", device_id);
-                }
-                self.device_manager
-                    .update_pair_state(&device_id, crate::device::PairState::NotPaired)
-                    .await;
-            }
-            AppEvent::Disconnect(device_id) => {
-                info!("frontend sent disconnect event to device: {}", device_id);
-                if guard.remove(&device_id).is_some() {
-                    self.conn_id_map.lock().await.remove(&device_id);
-                    let conn_event = ConnectionEvent::Disconnected(device_id);
-                    let _ = self.conn_tx.send(conn_event.clone());
-                    let _ = self.mpris_conn_tx.send(conn_event);
-                    info!("Connection closed.");
-                }
-            }
-            AppEvent::SetPluginEnabled {
-                device_id,
-                plugin_id,
-                enabled,
-            } => {
-                info!(
-                    "[plugin] {} plugin '{}' for device {}",
-                    if enabled { "enabling" } else { "disabling" },
-                    plugin_id,
-                    device_id
-                );
-                let mut disabled: std::collections::HashSet<String> =
-                    plugin_config::load_disabled_plugins(&device_id.0).await;
-                if enabled {
-                    disabled.remove(&plugin_id);
-                } else {
-                    disabled.insert(plugin_id.clone());
-                }
-                plugin_config::save_disabled_plugins(&device_id.0, &disabled).await;
-                self.plugin_registry
-                    .set_device_disabled(&device_id.0, disabled.clone())
-                    .await;
-
-                // Drop the connection so the phone reconnects. On reconnect the
-                // transport sends a filtered identity at handshake time, which is the
-                // correct mechanism for telling the phone which plugins are disabled.
-                // The phone processes capabilities only during connection setup.
-                if guard.remove(&device_id).is_some() {
-                    self.conn_id_map.lock().await.remove(&device_id);
-                    info!("[plugin] dropped connection to {} — phone will reconnect with updated capabilities", device_id);
-                }
-            }
-        };
-    }
-
-    pub fn take_events(&self) -> Arc<mpsc::UnboundedSender<AppEvent>> {
-        self.out_tx.clone()
     }
 }
 
-/// Remove all persisted data for a device on unpair.
-/// Cleans plugin config (~/.config/kdeconnect/) and cache (~/.local/share/kdeconnect/).
-async fn cleanup_device_data(device_id: &str) {
-    // Plugin enabled/disabled config
+pub async fn cleanup_device_data(device_id: &str) {
     if let Some(config_dir) = dirs::config_dir() {
-        let plugin_file = config_dir
-            .join("kdeconnect")
-            .join(format!("{}_plugins.json", device_id));
-        if let Err(e) = tokio::fs::remove_file(&plugin_file).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("[cleanup] failed to remove plugin config for {}: {}", device_id, e);
+        let kc_config = config_dir.join(config::CONFIG_DIR);
+        let mut dir = match tokio::fs::read_dir(&kc_config).await {
+            Ok(dir) => dir,
+            Err(_) => return,
+        };
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let path = entry.path();
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && stem.starts_with(device_id)
+            {
+                let _ = tokio::fs::remove_file(&path).await;
+                tracing::debug!("[cleanup] removed config file: {}", path.display());
             }
         }
     }
 
-    // SMS and contacts cache directory
-    if let Some(data_dir) = dirs::data_local_dir() {
-        let cache_dir = data_dir.join("kdeconnect").join(device_id);
-        if let Err(e) = tokio::fs::remove_dir_all(&cache_dir).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("[cleanup] failed to remove cache dir for {}: {}", device_id, e);
+    if let Some(local_share) = dirs::data_local_dir() {
+        let kc_cache = local_share.join(config::CONFIG_DIR);
+        let mut dir = match tokio::fs::read_dir(&kc_cache).await {
+            Ok(dir) => dir,
+            Err(_) => return,
+        };
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let path = entry.path();
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && (stem.starts_with(device_id) || stem == device_id)
+            {
+                if path.is_dir() {
+                    let _ = tokio::fs::remove_dir_all(&path).await;
+                    tracing::debug!("[cleanup] removed cache dir: {}", path.display());
+                } else {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    tracing::debug!("[cleanup] removed cache file: {}", path.display());
+                }
             }
         }
     }
 
     tracing::info!("[cleanup] removed persisted data for device {}", device_id);
+}
+
+#[cfg(test)]
+mod pairing_regression_tests {
+    use super::*;
+    use crate::core::connection::{
+        ConnectionHandle, UNPAIRED_RESYNC_INTERVAL, UnpairedResyncLimiter, install_connection,
+        is_current_connection, packet_allowed_for_pair_state, pair_false_packet, remove_connection,
+        remove_connection_if_current, remove_pairing_attempt,
+    };
+    use serde_json::json;
+    use tokio::time::timeout;
+
+    fn test_device_id(suffix: &str) -> DeviceId {
+        DeviceId(format!("pairing-regression-{suffix}"))
+    }
+
+    fn test_connection_handle() -> (
+        ConnectionHandle,
+        watch::Receiver<bool>,
+        mpsc::UnboundedReceiver<ProtocolPacket>,
+    ) {
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        (
+            ConnectionHandle {
+                write_tx,
+                shutdown_tx,
+            },
+            shutdown_rx,
+            write_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn replacing_device_connection_shuts_down_only_the_previous_link() {
+        let writer_map = Arc::new(Mutex::new(HashMap::new()));
+        let conn_id_map = Arc::new(Mutex::new(HashMap::new()));
+        let device_id = test_device_id("replace-one");
+
+        let (first, mut first_shutdown, _first_rx) = test_connection_handle();
+        let (second, second_shutdown, mut second_rx) = test_connection_handle();
+
+        install_connection(&writer_map, &conn_id_map, device_id.clone(), 1, first).await;
+        install_connection(&writer_map, &conn_id_map, device_id.clone(), 2, second).await;
+
+        first_shutdown.changed().await.unwrap();
+        assert!(*first_shutdown.borrow());
+        assert!(!*second_shutdown.borrow());
+        assert!(is_current_connection(&conn_id_map, &device_id, 2).await);
+        assert!(!is_current_connection(&conn_id_map, &device_id, 1).await);
+
+        let sender = writer_map
+            .lock()
+            .await
+            .get(&device_id)
+            .unwrap()
+            .write_tx
+            .clone();
+        let pkt = ProtocolPacket::new(PacketType::Ping, json!({}));
+        sender.send(pkt).unwrap();
+        assert!(matches!(
+            second_rx.recv().await.unwrap().packet_type,
+            PacketType::Ping
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_disconnect_cannot_remove_newer_connection() {
+        let writer_map = Arc::new(Mutex::new(HashMap::new()));
+        let conn_id_map = Arc::new(Mutex::new(HashMap::new()));
+        let device_id = test_device_id("stale-disconnect");
+
+        let (first, mut first_shutdown, _first_rx) = test_connection_handle();
+        let (second, mut second_shutdown, _second_rx) = test_connection_handle();
+
+        install_connection(&writer_map, &conn_id_map, device_id.clone(), 10, first).await;
+        install_connection(&writer_map, &conn_id_map, device_id.clone(), 11, second).await;
+        first_shutdown.changed().await.unwrap();
+
+        assert!(!remove_connection_if_current(&writer_map, &conn_id_map, &device_id, 10).await);
+        assert!(writer_map.lock().await.contains_key(&device_id));
+        assert!(!*second_shutdown.borrow());
+        assert!(
+            timeout(Duration::from_millis(25), second_shutdown.changed())
+                .await
+                .is_err()
+        );
+        assert!(is_current_connection(&conn_id_map, &device_id, 11).await);
+    }
+
+    #[tokio::test]
+    async fn dropping_connection_shuts_down_only_that_device() {
+        let writer_map = Arc::new(Mutex::new(HashMap::new()));
+        let conn_id_map = Arc::new(Mutex::new(HashMap::new()));
+        let first_id = test_device_id("drop-first");
+        let second_id = test_device_id("drop-second");
+
+        let (first, mut first_shutdown, _first_rx) = test_connection_handle();
+        let (second, second_shutdown, _second_rx) = test_connection_handle();
+
+        install_connection(&writer_map, &conn_id_map, first_id.clone(), 1, first).await;
+        install_connection(&writer_map, &conn_id_map, second_id.clone(), 1, second).await;
+
+        assert!(remove_connection(&writer_map, &conn_id_map, &first_id).await);
+        first_shutdown.changed().await.unwrap();
+        assert!(*first_shutdown.borrow());
+        assert!(!writer_map.lock().await.contains_key(&first_id));
+        assert!(!is_current_connection(&conn_id_map, &first_id, 1).await);
+
+        assert!(writer_map.lock().await.contains_key(&second_id));
+        assert!(is_current_connection(&conn_id_map, &second_id, 1).await);
+        assert!(!*second_shutdown.borrow());
+    }
+
+    #[tokio::test]
+    async fn repeated_reconnect_churn_is_isolated_across_devices() {
+        let writer_map = Arc::new(Mutex::new(HashMap::new()));
+        let conn_id_map = Arc::new(Mutex::new(HashMap::new()));
+        let ids = vec![
+            test_device_id("churn-a"),
+            test_device_id("churn-b"),
+            test_device_id("churn-c"),
+        ];
+        let mut tasks = Vec::new();
+        for id in ids.clone() {
+            let writer_map = writer_map.clone();
+            let conn_id_map = conn_id_map.clone();
+            tasks.push(tokio::spawn(async move {
+                for conn_id in 0..25 {
+                    let (handle, _shutdown, _rx) = test_connection_handle();
+                    install_connection(&writer_map, &conn_id_map, id.clone(), conn_id, handle)
+                        .await;
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let writers = writer_map.lock().await;
+        assert_eq!(writers.len(), ids.len());
+        drop(writers);
+        for id in ids {
+            assert!(is_current_connection(&conn_id_map, &id, 24).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_replacements_keep_writer_and_conn_id_in_sync() {
+        let writer_map = Arc::new(Mutex::new(HashMap::new()));
+        let conn_id_map = Arc::new(Mutex::new(HashMap::new()));
+        let device_id = test_device_id("same-device-race");
+        let mut receivers = HashMap::new();
+        let mut shutdowns = HashMap::new();
+        let mut tasks = Vec::new();
+        for conn_id in 0..50 {
+            let (handle, shutdown_rx, rx) = test_connection_handle();
+            receivers.insert(conn_id, rx);
+            shutdowns.insert(conn_id, shutdown_rx);
+            let writer_map = writer_map.clone();
+            let conn_id_map = conn_id_map.clone();
+            let id = device_id.clone();
+            tasks.push(tokio::spawn(async move {
+                install_connection(&writer_map, &conn_id_map, id, conn_id, handle).await;
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let current_conn_id = conn_id_map
+            .lock()
+            .await
+            .get(&device_id)
+            .copied()
+            .expect("missing current conn_id");
+        let sender = writer_map
+            .lock()
+            .await
+            .get(&device_id)
+            .expect("missing current writer")
+            .write_tx
+            .clone();
+        sender
+            .send(ProtocolPacket::new(PacketType::Ping, json!({})))
+            .unwrap();
+        let current_rx = receivers
+            .get_mut(&current_conn_id)
+            .expect("missing current receiver");
+        assert!(matches!(
+            timeout(Duration::from_secs(1), current_rx.recv()).await,
+            Ok(Some(packet)) if matches!(packet.packet_type, PacketType::Ping)
+        ));
+        for (conn_id, mut shutdown_rx) in shutdowns {
+            if conn_id == current_conn_id {
+                assert!(!*shutdown_rx.borrow());
+            } else if !*shutdown_rx.borrow() {
+                timeout(Duration::from_secs(1), shutdown_rx.changed())
+                    .await
+                    .expect("superseded connection was not shut down")
+                    .unwrap();
+                assert!(*shutdown_rx.borrow());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pairing_attempt_cancellation_is_per_device() {
+        let attempts = Arc::new(Mutex::new(HashMap::new()));
+        let first_id = test_device_id("attempt-first");
+        let second_id = test_device_id("attempt-second");
+        attempts.lock().await.insert(first_id.clone(), 7);
+        attempts.lock().await.insert(second_id.clone(), 13);
+        remove_pairing_attempt(&attempts, &first_id).await;
+        let guard = attempts.lock().await;
+        assert!(!guard.contains_key(&first_id));
+        assert_eq!(guard.get(&second_id).copied(), Some(13));
+    }
+
+    #[test]
+    fn unpaired_resync_packet_is_pair_false_without_timestamp() {
+        let pkt = pair_false_packet();
+        assert!(matches!(pkt.packet_type, PacketType::Pair));
+        let pair = serde_json::from_value::<Pair>(pkt.body).unwrap();
+        assert!(!pair.pair);
+        assert!(pair.timestamp.is_none());
+    }
+
+    #[test]
+    fn only_protocol_packets_can_be_sent_before_pairing() {
+        use crate::protocol::PacketType as PT;
+        let feature_packets = [
+            PT::Battery,
+            PT::BatteryRequest,
+            PT::Clipboard,
+            PT::ClipboardConnect,
+            PT::ConnectivityReport,
+            PT::ConnectivityReportRequest,
+            PT::Digitizer,
+            PT::DigitizerSession,
+            PT::ContactsRequestAllUidsTimestamps,
+            PT::ContactsRequestVcardsByUid,
+            PT::ContactsResponseUidsTimestamps,
+            PT::ContactsResponseVcards,
+            PT::FindMyPhoneRequest,
+            PT::Lock,
+            PT::LockRequest,
+            PT::MousePadEcho,
+            PT::MousePadKeyboardState,
+            PT::MousePadRequest,
+            PT::Mpris,
+            PT::MprisRequest,
+            PT::Notification,
+            PT::NotificationAction,
+            PT::NotificationReply,
+            PT::NotificationRequest,
+            PT::Ping,
+            PT::Presenter,
+            PT::RunCommand,
+            PT::RunCommandRequest,
+            PT::Sftp,
+            PT::SftpRequest,
+            PT::ShareRequest,
+            PT::ShareRequestUpdate,
+            PT::SmsAttachmentFile,
+            PT::SmsMessages,
+            PT::SmsRequest,
+            PT::SmsRequestAttachment,
+            PT::SmsRequestConversation,
+            PT::SmsRequestConversations,
+            PT::SystemVolume,
+            PT::SystemVolumeRequest,
+            PT::Telephony,
+            PT::TelephonyRequestMute,
+            PT::Unknown("kdeconnect.future.packet".to_string()),
+        ];
+        for pt in feature_packets {
+            assert!(
+                !packet_allowed_for_pair_state(&pt, Some(PairState::NotPaired)),
+                "{pt:?} should not be sent before pairing"
+            );
+            assert!(
+                packet_allowed_for_pair_state(&pt, Some(PairState::Paired)),
+                "{pt:?} should be sent when paired"
+            );
+        }
+        assert!(packet_allowed_for_pair_state(
+            &PT::Pair,
+            Some(PairState::NotPaired)
+        ));
+        assert!(packet_allowed_for_pair_state(
+            &PT::Identity,
+            Some(PairState::NotPaired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unpaired_resync_is_throttled_per_device() {
+        use std::time::Instant;
+        let limiter = UnpairedResyncLimiter::default();
+        let first_id = test_device_id("resync-first");
+        let second_id = test_device_id("resync-second");
+        let now = Instant::now();
+        assert!(limiter.should_send_at(&first_id, now).await);
+        assert!(!limiter.should_send_at(&first_id, now).await);
+        assert!(limiter.should_send_at(&second_id, now).await);
+        assert!(
+            limiter
+                .should_send_at(&first_id, now + UNPAIRED_RESYNC_INTERVAL)
+                .await
+        );
+        limiter.clear(&first_id).await;
+        assert!(limiter.should_send_at(&first_id, now).await);
+    }
 }
