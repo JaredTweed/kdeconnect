@@ -27,15 +27,15 @@
 - Plugin Enable / Disable per device
 - System Volume (Partial support - May not work on certain devices - Known Mobile App Bug)
 - Telephony (Know bug - Media does not resume when Ending/Canceling Call)
+- MousePad / Remote Input
+- Presenter Mode
+- SFTP / Browse Device
 
 </details>
 
 <details>
 <summary>🚧 Features Not Yet Supported</summary>
 
-- MousePad / Remote Input
-- Presenter Mode
-- SFTP / Browse Device
 - Virtual Display
 
 </details>
@@ -69,6 +69,11 @@ just install
 ```
 
 The service starts automatically on next login via D-Bus activation and XDG autostart.
+
+Once it is installed, you can easily apply your updates to your desktop with this singular command without having to log out:
+```bash
+cargo fmt && cargo test --workspace && cargo check --workspace && just build && just install && just restart
+```
 
 ### Optional: Systemd Integration
 
@@ -144,6 +149,3 @@ sudo iptables -A OUTPUT -o <yourinterface> -p tcp --sport 1714:1764 -m state --s
 ```
 
 For more, directly from official KDEConnect userbase: [KDEConnect Firewall](https://userbase.kde.org/KDEConnect#ufw)
-
-
-
