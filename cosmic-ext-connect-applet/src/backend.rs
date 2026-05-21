@@ -25,12 +25,29 @@ pub async fn initialize() -> Result<()> {
     Ok(())
 }
 
+async fn ensure_initialized() -> Result<()> {
+    if CLIENT.lock().await.is_some() {
+        return Ok(());
+    }
+
+    initialize().await
+}
+
+async fn get_client() -> Result<Arc<KdeConnectClient>> {
+    match CLIENT.lock().await.clone() {
+        Some(client) => Ok(client),
+        None => Err(anyhow::anyhow!("D-Bus client not initialized")),
+    }
+}
+
 /// Fetch all devices from the service
 pub async fn fetch_devices() -> Vec<Device> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        warn!("D-Bus client not initialized");
-        return vec![];
+    let client = match CLIENT.lock().await.clone() {
+        Some(c) => c,
+        None => {
+            warn!("D-Bus client not initialized");
+            return vec![];
+        }
     };
 
     match client.list_devices().await {
@@ -40,10 +57,21 @@ pub async fn fetch_devices() -> Vec<Device> {
                 .into_iter()
                 .map(|d| {
                     let existing = cache.get(&d.id).cloned();
+                    let remote_accepts = |capability: &str| {
+                        d.incoming_capabilities.iter().any(|cap| cap == capability)
+                    };
+                    let remote_sends = |capability: &str| {
+                        d.outgoing_capabilities.iter().any(|cap| cap == capability)
+                    };
+                    let remote_accepts_any = |capabilities: &[&str]| {
+                        capabilities
+                            .iter()
+                            .any(|capability| remote_accepts(capability))
+                    };
                     let device = Device {
                         id: d.id.clone(),
                         name: d.name.clone(),
-                        device_type: "phone".to_string(),
+                        device_type: d.device_type.clone(),
                         is_paired: d.is_paired,
                         is_reachable: d.is_reachable,
                         battery_level: existing.as_ref().and_then(|e| e.battery_level),
@@ -51,21 +79,42 @@ pub async fn fetch_devices() -> Vec<Device> {
                         network_type: existing.as_ref().and_then(|e| e.network_type.clone()),
                         signal_strength: existing.as_ref().and_then(|e| e.signal_strength),
                         pairing_requests: 0,
-                        has_battery: false,
-                        has_ping: true,
-                        has_sms: true,
-                        has_contacts: false,
-                        has_clipboard: true,
-                        has_findmyphone: true,
-                        has_share: true,
+                        has_battery: remote_sends("kdeconnect.battery"),
+                        has_ping: remote_accepts("kdeconnect.ping"),
+                        has_sms: remote_accepts_any(&[
+                            "kdeconnect.sms.request",
+                            "kdeconnect.sms.request_conversations",
+                            "kdeconnect.sms.request_conversation",
+                        ]),
+                        has_contacts: remote_accepts_any(&[
+                            "kdeconnect.contacts.request_all_uids_timestamps",
+                            "kdeconnect.contacts.request_vcards_by_uid",
+                        ]),
+                        has_clipboard: remote_accepts("kdeconnect.clipboard"),
+                        has_findmyphone: remote_accepts("kdeconnect.findmyphone.request"),
+                        has_share: remote_accepts("kdeconnect.share.request"),
                         share_progress: existing.as_ref().and_then(|e| e.share_progress),
-                        has_sftp: false,
-                        has_mpris: false,
-                        has_remote_keyboard: false,
-                        has_presenter: false,
-                        has_lockdevice: false,
-                        has_virtualmonitor: false,
-                        run_commands: existing.as_ref().map(|e| e.run_commands.clone()).unwrap_or_default(),
+                        has_sftp: remote_accepts("kdeconnect.sftp.request"),
+                        has_mpris: remote_accepts_any(&[
+                            "kdeconnect.mpris",
+                            "kdeconnect.mpris.request",
+                        ]),
+                        has_remote_keyboard: remote_accepts_any(&[
+                            "kdeconnect.mousepad.echo",
+                            "kdeconnect.mousepad.request",
+                            "kdeconnect.mousepad.keyboardstate",
+                        ]),
+                        has_presenter: remote_accepts("kdeconnect.presenter"),
+                        has_digitizer: remote_sends("kdeconnect.digitizer"),
+                        has_lockdevice: remote_accepts_any(&[
+                            "kdeconnect.lock",
+                            "kdeconnect.lock.request",
+                        ]),
+                        has_virtualmonitor: remote_accepts("kdeconnect.virtualmonitor"),
+                        run_commands: existing
+                            .as_ref()
+                            .map(|e| e.run_commands.clone())
+                            .unwrap_or_default(),
                     };
                     cache.insert(d.id.clone(), device.clone());
                     device
@@ -78,6 +127,23 @@ pub async fn fetch_devices() -> Vec<Device> {
             vec![]
         }
     }
+}
+
+/// Actively scan for devices, then return the refreshed service list.
+pub async fn scan_devices() -> Vec<Device> {
+    if let Err(e) = ensure_initialized().await {
+        warn!("D-Bus client not initialized while scanning: {:?}", e);
+        return vec![];
+    }
+
+    if let Err(e) = broadcast_identity().await {
+        warn!("Failed to broadcast identity while scanning: {:?}", e);
+    }
+
+    // Give peers time to receive the UDP identity, open TCP/TLS, and let the
+    // daemon publish the resulting device before the settings page refreshes.
+    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+    fetch_devices().await
 }
 
 /// Update device in cache
@@ -93,99 +159,76 @@ pub async fn remove_device(device_id: &str) {
 
 /// Pair with a device
 pub async fn pair_device(device_id: String) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.pair_device(&device_id).await
+    get_client().await?.pair_device(&device_id).await
 }
 
 /// Unpair from a device
 pub async fn unpair_device(device_id: String) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.unpair_device(&device_id).await
+    get_client().await?.unpair_device(&device_id).await
 }
 
 /// Send a ping to a device
 pub async fn ping_device(device_id: String) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.send_ping(&device_id, "Ping from COSMIC!").await
+    get_client()
+        .await?
+        .send_ping(&device_id, "Ping from COSMIC!")
+        .await
 }
 
 /// Send files to a device
 pub async fn send_files(device_id: String, files: Vec<String>) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.send_files(&device_id, files).await
+    get_client().await?.send_files(&device_id, files).await
 }
 
 /// Send clipboard content to a device
 pub async fn send_clipboard(device_id: String, content: String) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.send_clipboard(&device_id, &content).await
+    get_client()
+        .await?
+        .send_clipboard(&device_id, &content)
+        .await
 }
 
 /// Browse device filesystem (via SFTP)
-pub async fn browse_device_filesystem(_device_id: String) -> Result<()> {
-    warn!("Browse filesystem not yet implemented via D-Bus");
-    Ok(())
+pub async fn browse_device_filesystem(device_id: String) -> Result<()> {
+    get_client()
+        .await?
+        .browse_device_filesystem(&device_id)
+        .await
 }
 
 /// Accept an incoming pairing request from a device
 pub async fn accept_pairing(device_id: String) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.accept_pairing(&device_id).await
+    get_client().await?.accept_pairing(&device_id).await
 }
 
 /// Reject an incoming pairing request from a device
 pub async fn reject_pairing(device_id: String) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.reject_pairing(&device_id).await
+    get_client().await?.reject_pairing(&device_id).await
 }
 
 /// Ring a device (findmyphone)
 pub async fn ring_device(device_id: String) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.ring_device(&device_id).await
+    get_client().await?.ring_device(&device_id).await
 }
 
 /// Enable or disable a plugin for a device
 #[allow(dead_code)]
 pub async fn set_plugin_enabled(device_id: String, plugin_id: String, enabled: bool) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.set_plugin_enabled(&device_id, &plugin_id, enabled).await
+    get_client()
+        .await?
+        .set_plugin_enabled(&device_id, &plugin_id, enabled)
+        .await
 }
 
 /// Return the list of disabled plugin IDs for a device
 #[allow(dead_code)]
 pub async fn get_disabled_plugins(device_id: String) -> Vec<String> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        warn!("D-Bus client not initialized");
-        return vec![];
+    let client = match get_client().await {
+        Ok(c) => c,
+        Err(_) => {
+            warn!("D-Bus client not initialized");
+            return vec![];
+        }
     };
     match client.get_disabled_plugins(&device_id).await {
         Ok(disabled) => disabled,
@@ -199,64 +242,45 @@ pub async fn get_disabled_plugins(device_id: String) -> Vec<String> {
 /// Broadcast our identity packet over UDP to trigger device discovery
 #[allow(dead_code)]
 pub async fn broadcast_identity() -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.broadcast_identity().await
+    get_client().await?.broadcast_identity().await
 }
 
 /// Request SMS conversations from a device
 #[allow(dead_code)]
 pub async fn request_conversations(device_id: String) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.request_conversations(&device_id).await
+    get_client().await?.request_conversations(&device_id).await
 }
 
 /// Request a specific SMS conversation thread
 #[allow(dead_code)]
 pub async fn request_conversation(device_id: String, thread_id: i64) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.request_conversation(&device_id, thread_id).await
+    get_client()
+        .await?
+        .request_conversation(&device_id, thread_id)
+        .await
 }
 
 /// Send an SMS message
 #[allow(dead_code)]
 pub async fn send_sms(device_id: String, phone_number: String, message: String) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.send_sms(&device_id, &phone_number, &message).await
+    get_client()
+        .await?
+        .send_sms(&device_id, &phone_number, &message)
+        .await
 }
 
 /// Request the remote command list from a device
 pub async fn request_run_commands(device_id: String) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.request_run_commands(&device_id).await
+    get_client().await?.request_run_commands(&device_id).await
 }
 
 /// Execute a remote command on a device by key
 pub async fn execute_run_command(device_id: String, key: String) -> Result<()> {
-    let client_guard = CLIENT.lock().await;
-    let Some(client) = client_guard.as_ref() else {
-        return Err(anyhow::anyhow!("D-Bus client not initialized"));
-    };
-    client.run_command(&device_id, &key).await
+    get_client().await?.run_command(&device_id, &key).await
 }
 
 /// Stream of service events. Reconnects automatically when the client is
 /// replaced (e.g. after session logout/login) or the stream ends.
-#[allow(dead_code)]
 pub async fn event_stream() -> futures::stream::BoxStream<'static, ServiceEvent> {
     use tokio::sync::mpsc;
     use tokio::time::{Duration, sleep};
@@ -298,11 +322,10 @@ pub async fn event_stream() -> futures::stream::BoxStream<'static, ServiceEvent>
                     _ = async {
                         loop {
                             sleep(Duration::from_millis(500)).await;
-                            if let Some(current) = CLIENT.lock().await.clone() {
-                                if !Arc::ptr_eq(&current, &client) {
+                            if let Some(current) = CLIENT.lock().await.clone()
+                                && !Arc::ptr_eq(&current, &client) {
                                     return;
                                 }
-                            }
                         }
                     } => {
                         info!("D-Bus client replaced, reconnecting event stream");
@@ -346,31 +369,36 @@ pub fn service_watcher_subscription() -> Subscription<crate::messages::Message> 
             while let Some(Ok(msg)) = stream.next().await {
                 let msg: zbus::Message = msg;
                 if let Ok((_name, _old, new_owner)) = msg.body().deserialize::<(String, String, String)>() {
-                    if !new_owner.is_empty() {
-                        // Service has a new owner — reinitialize the client.
-                        info!("kdeconnect service reappeared on bus — reinitializing client");
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                        if let Err(e) = initialize().await {
-                            error!("Failed to reinitialize D-Bus client: {:?}", e);
-                            continue;
+                    if new_owner.is_empty() {
+                        // Service disappeared — invalidate client so pending
+                        // operations fail fast and reconnection waits cleanly.
+                        info!("kdeconnect service disappeared from bus — invalidating client");
+                        *CLIENT.lock().await = None;
+                        continue;
+                    }
+                    // Service has a new owner — reinitialize the client.
+                    info!("kdeconnect service reappeared on bus — reinitializing client");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    if let Err(e) = initialize().await {
+                        error!("Failed to reinitialize D-Bus client: {:?}", e);
+                        continue;
+                    }
+                    // Broadcast so paired phones reconnect immediately.
+                    broadcast_identity().await.ok();
+                    // Poll until devices appear or give up after 90s.
+                    let mut elapsed = 0u64;
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        elapsed += 3;
+                        let devices = scan_devices().await;
+                        if !devices.is_empty() {
+                            info!("Device found after {}s — yielding refresh", elapsed);
+                            yield crate::messages::Message::RefreshDevices;
+                            break;
                         }
-                        // Broadcast so paired phones reconnect immediately.
-                        broadcast_identity().await.ok();
-                        // Poll until devices appear or give up after 90s.
-                        let mut elapsed = 0u64;
-                        loop {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                            elapsed += 3;
-                            let devices = fetch_devices().await;
-                            if !devices.is_empty() {
-                                info!("Device found after {}s — yielding refresh", elapsed);
-                                yield crate::messages::Message::RefreshDevices;
-                                break;
-                            }
-                            if elapsed >= 90 {
-                                warn!("Gave up waiting for devices after 90s");
-                                break;
-                            }
+                        if elapsed >= 90 {
+                            warn!("Gave up waiting for devices after 90s");
+                            break;
                         }
                     }
                 }
@@ -380,19 +408,51 @@ pub fn service_watcher_subscription() -> Subscription<crate::messages::Message> 
 }
 
 /// Subscription for file transfer progress updates
-#[allow(dead_code)]
 pub fn filetransfer_subscription() -> Subscription<crate::messages::Message> {
     struct Worker;
 
     Subscription::run_with(TypeId::of::<Worker>(), |_| {
         async_stream::stream! {
-            let Ok(client) = KdeConnectClient::new().await else {
-                return;
-            };
+            use tokio::time::{Duration, sleep};
 
-            let mut progress_stream = client.transfer_progress_stream().await;
-            while let Some(progress) = progress_stream.next().await {
-                yield crate::messages::Message::UpdateTransferProgress(progress);
+            'reconnect: loop {
+                let client = 'wait: loop {
+                    if let Some(c) = CLIENT.lock().await.clone() {
+                        break 'wait c;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                };
+
+                let mut progress_stream = client.transfer_progress_stream().await;
+
+                loop {
+                    tokio::select! {
+                        event = progress_stream.next() => {
+                            match event {
+                                Some(progress) => {
+                                    yield crate::messages::Message::UpdateTransferProgress(progress);
+                                }
+                                None => {
+                                    warn!("Transfer progress stream ended, reconnecting in 1s");
+                                    sleep(Duration::from_secs(1)).await;
+                                    continue 'reconnect;
+                                }
+                            }
+                        }
+                        _ = async {
+                            loop {
+                                sleep(Duration::from_millis(500)).await;
+                                if let Some(current) = CLIENT.lock().await.clone()
+                                    && !Arc::ptr_eq(&current, &client) {
+                                        return;
+                                    }
+                            }
+                        } => {
+                            info!("D-Bus client replaced, reconnecting transfer progress stream");
+                            continue 'reconnect;
+                        }
+                    }
+                }
             }
         }
     })
