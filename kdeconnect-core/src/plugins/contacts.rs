@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use crate::event::ConnectionEvent;
+use crate::{device::DeviceId, event::ConnectionEvent};
 
 /// Parses a vCard string and returns (Option<name>, Vec<phone_numbers>)
 pub fn parse_vcard(content: &str) -> (Option<String>, Vec<String>) {
@@ -12,8 +12,8 @@ pub fn parse_vcard(content: &str) -> (Option<String>, Vec<String>) {
 
     for line in content.lines() {
         let line = line.trim();
-        if line.starts_with("FN:") {
-            name = Some(line[3..].trim().to_string());
+        if let Some(stripped) = line.strip_prefix("FN:") {
+            name = Some(stripped.trim().to_string());
         } else if name.is_none() && line.starts_with("N:") {
             let parts: Vec<&str> = line[2..].split(';').collect();
             if parts.len() >= 2 {
@@ -24,12 +24,12 @@ pub fn parse_vcard(content: &str) -> (Option<String>, Vec<String>) {
                     name = Some(full);
                 }
             }
-        } else if line.starts_with("TEL") {
-            if let Some(pos) = line.rfind(':') {
-                let phone = line[pos + 1..].trim().to_string();
-                if !phone.is_empty() {
-                    phones.push(phone);
-                }
+        } else if line.starts_with("TEL")
+            && let Some(pos) = line.rfind(':')
+        {
+            let phone = line[pos + 1..].trim().to_string();
+            if !phone.is_empty() {
+                phones.push(phone);
             }
         }
     }
@@ -53,7 +53,11 @@ pub fn parse_uids_timestamps(body: &Value) -> Vec<String> {
 
 /// Parses a `kdeconnect.contacts.response_vcards` packet body and emits
 /// a `ConnectionEvent::ContactsReceived` with a phone → name map.
-pub fn parse_vcards_and_emit(body: &Value, tx: &mpsc::UnboundedSender<ConnectionEvent>) {
+pub fn parse_vcards_and_emit(
+    device_id: DeviceId,
+    body: &Value,
+    tx: &mpsc::UnboundedSender<ConnectionEvent>,
+) {
     let uids: Vec<String> = match body.get("uids").and_then(|v| v.as_array()) {
         Some(arr) => arr
             .iter()
@@ -83,10 +87,49 @@ pub fn parse_vcards_and_emit(body: &Value, tx: &mpsc::UnboundedSender<Connection
         contacts.len(),
         uids.len()
     );
-    let _ = tx.send(ConnectionEvent::ContactsReceived(contacts));
+    let _ = tx.send(ConnectionEvent::ContactsReceived(device_id, contacts));
 }
 
 /// Builds the body for a `kdeconnect.contacts.request_vcards_by_uid` packet.
 pub fn build_vcards_request(uids: Vec<String>) -> Value {
     serde_json::json!({ "uids": uids })
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc;
+
+    use super::{build_vcards_request, parse_vcards_and_emit};
+    use crate::{device::DeviceId, event::ConnectionEvent};
+
+    #[test]
+    fn build_vcards_request_uses_protocol_uids_shape() {
+        assert_eq!(
+            build_vcards_request(vec!["1".to_string(), "2".to_string()]),
+            serde_json::json!({ "uids": ["1", "2"] })
+        );
+    }
+
+    #[test]
+    fn emits_contacts_with_source_device_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let device_id = DeviceId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        parse_vcards_and_emit(
+            device_id.clone(),
+            &serde_json::json!({
+                "uids": ["contact-1"],
+                "contact-1": "BEGIN:VCARD\nFN:Jane Doe\nTEL;TYPE=CELL:+15551234567\nEND:VCARD\n"
+            }),
+            &tx,
+        );
+
+        let event = rx.try_recv().expect("contacts event");
+        match event {
+            ConnectionEvent::ContactsReceived(id, contacts) => {
+                assert_eq!(id, device_id);
+                assert_eq!(contacts.get("+15551234567"), Some(&"Jane Doe".to_string()));
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
 }

@@ -1,7 +1,14 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tokio::sync::mpsc;
+use std::path::PathBuf;
+use tokio::{fs, sync::mpsc};
+use tracing::debug;
 
-use crate::{device::DeviceState, event::ConnectionEvent, plugin_interface::Plugin};
+use crate::{
+    device::{DeviceId, DeviceState},
+    event::{ConnectionEvent, CoreEvent},
+    plugin_interface::Plugin,
+    protocol::{PacketType, ProtocolPacket},
+};
 
 fn serialize_threshold<S>(x: &bool, s: S) -> Result<S::Ok, S::Error>
 where
@@ -14,26 +21,24 @@ fn deserialize_threshold<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let buf = i32::deserialize(deserializer)?;
-
-    match buf {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(serde::de::Error::invalid_value(
-            serde::de::Unexpected::Signed(buf.into()),
-            &"0 or 1",
-        )),
+    use serde_json::Value;
+    let v = Value::deserialize(deserializer)?;
+    match v {
+        Value::Bool(b) => Ok(b),
+        Value::Number(n) => Ok(n.as_i64().unwrap_or(0) != 0),
+        _ => Ok(false),
     }
 }
 
 #[derive(Serialize, Deserialize, Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Battery {
     #[serde(rename = "currentCharge")]
-    pub charge: u8,
+    pub charge: i32,
     #[serde(rename = "isCharging")]
     pub is_charging: bool,
     #[serde(
         rename = "thresholdEvent",
+        default,
         serialize_with = "serialize_threshold",
         deserialize_with = "deserialize_threshold"
     )]
@@ -47,12 +52,147 @@ impl Plugin for Battery {
 }
 
 impl Battery {
-    pub async fn received_packet(&self, event: mpsc::UnboundedSender<ConnectionEvent>) {
-        event
-            .send(ConnectionEvent::StateUpdated(DeviceState::Battery {
+    pub async fn received_packet(
+        &self,
+        device_id: DeviceId,
+        event: mpsc::UnboundedSender<ConnectionEvent>,
+    ) {
+        let _ = event.send(ConnectionEvent::StateUpdated((
+            device_id,
+            DeviceState::Battery {
                 level: self.charge,
                 charging: self.is_charging,
-            }))
-            .unwrap();
+            },
+        )));
+    }
+}
+
+pub async fn send_local_state(device: DeviceId, event: mpsc::UnboundedSender<CoreEvent>) {
+    let battery = read_local_battery().await.unwrap_or_else(no_local_battery);
+
+    let packet = ProtocolPacket::new(
+        PacketType::Battery,
+        serde_json::to_value(battery).unwrap_or_default(),
+    );
+    let _ = event.send(CoreEvent::SendPacket { device, packet });
+}
+
+fn no_local_battery() -> Battery {
+    Battery {
+        charge: -1,
+        is_charging: false,
+        under_threshold: false,
+    }
+}
+
+async fn read_local_battery() -> Option<Battery> {
+    let mut entries = fs::read_dir("/sys/class/power_supply").await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let kind = read_trimmed(path.join("type")).await.unwrap_or_default();
+        if kind != "Battery" {
+            continue;
+        }
+
+        let charge = read_trimmed(path.join("capacity"))
+            .await
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(100);
+        let status = read_trimmed(path.join("status")).await.unwrap_or_default();
+        let is_charging = matches!(status.as_str(), "Charging" | "Full");
+
+        return Some(Battery {
+            charge,
+            is_charging,
+            under_threshold: charge <= 15,
+        });
+    }
+
+    debug!("[battery] no local battery found; reporting no-battery sentinel");
+    None
+}
+
+async fn read_trimmed(path: PathBuf) -> Option<String> {
+    fs::read_to_string(path)
+        .await
+        .ok()
+        .map(|value| value.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Battery, no_local_battery};
+
+    #[test]
+    fn accepts_protocol_no_battery_sentinel() {
+        let battery: Battery = serde_json::from_value(serde_json::json!({
+            "currentCharge": -1,
+            "isCharging": false,
+            "thresholdEvent": 0
+        }))
+        .unwrap();
+
+        assert_eq!(battery.charge, -1);
+        assert!(!battery.is_charging);
+    }
+
+    #[test]
+    fn defaults_missing_threshold_event_to_false() {
+        let battery: Battery = serde_json::from_value(serde_json::json!({
+            "currentCharge": 87,
+            "isCharging": true
+        }))
+        .unwrap();
+
+        assert_eq!(battery.charge, 87);
+        assert!(battery.is_charging);
+        assert!(!battery.under_threshold);
+    }
+
+    #[test]
+    fn accepts_boolean_threshold_event() {
+        let battery: Battery = serde_json::from_value(serde_json::json!({
+            "currentCharge": 10,
+            "isCharging": false,
+            "thresholdEvent": true
+        }))
+        .unwrap();
+        assert!(battery.under_threshold);
+
+        let battery: Battery = serde_json::from_value(serde_json::json!({
+            "currentCharge": 80,
+            "isCharging": true,
+            "thresholdEvent": false
+        }))
+        .unwrap();
+        assert!(!battery.under_threshold);
+    }
+
+    #[test]
+    fn accepts_integer_threshold_event() {
+        let battery: Battery = serde_json::from_value(serde_json::json!({
+            "currentCharge": 10,
+            "isCharging": false,
+            "thresholdEvent": 1
+        }))
+        .unwrap();
+        assert!(battery.under_threshold);
+
+        let battery: Battery = serde_json::from_value(serde_json::json!({
+            "currentCharge": 80,
+            "isCharging": true,
+            "thresholdEvent": 0
+        }))
+        .unwrap();
+        assert!(!battery.under_threshold);
+    }
+
+    #[test]
+    fn no_local_battery_uses_protocol_sentinel() {
+        let battery = no_local_battery();
+
+        assert_eq!(battery.charge, -1);
+        assert!(!battery.is_charging);
+        assert!(!battery.under_threshold);
     }
 }

@@ -1,4 +1,4 @@
-use crate::device::DeviceState;
+use crate::device::{DeviceId, DeviceState};
 use crate::event::ConnectionEvent;
 use crate::plugin_interface::Plugin;
 use serde::{Deserialize, Serialize};
@@ -69,14 +69,16 @@ impl Plugin for ConnectivityReport {
     }
 }
 impl ConnectivityReport {
-    pub async fn received_packet(&self, event: mpsc::UnboundedSender<ConnectionEvent>) {
+    pub async fn received_packet(
+        &self,
+        device_id: DeviceId,
+        event: mpsc::UnboundedSender<ConnectionEvent>,
+    ) {
         self.signal_strengths.values().for_each(|v| {
-            event
-                .send(ConnectionEvent::StateUpdated(DeviceState::Connectivity((
-                    v.network_type.to_string(),
-                    v.signal_strength,
-                ))))
-                .unwrap();
+            let _ = event.send(ConnectionEvent::StateUpdated((
+                device_id.clone(),
+                DeviceState::Connectivity((v.network_type.to_string(), v.signal_strength)),
+            )));
         });
     }
 }
