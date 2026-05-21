@@ -2789,10 +2789,12 @@ dependencies = [
  "base64",
  "dirs",
  "hostname",
+ "libc",
  "libpulse-binding",
  "mpris",
  "notify-rust",
  "once_cell",
+ "percent-encoding",
  "pin-project",
  "rcgen",
  "ron",
@@ -2806,6 +2808,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "uuid",
+ "x509-parser",
  "zbus",
 ]
 

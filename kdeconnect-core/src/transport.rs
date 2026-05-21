@@ -611,6 +611,8 @@ async fn filtered_identity_for_device(device_id: &str) -> Identity {
         device_type: base.device_type,
         protocol_version: base.protocol_version,
         tcp_port: base.tcp_port,
+        target_device_id: None,
+        target_protocol_version: None,
         incoming_capabilities: base.incoming_capabilities.iter()
             .filter(|c| !remove_inc.contains(c.as_str()))
             .cloned()

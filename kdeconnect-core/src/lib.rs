@@ -36,6 +36,10 @@ pub use protocol::{PacketType, ProtocolPacket};
 
 pub static GLOBAL_CONFIG: OnceLock<config::Config> = OnceLock::new();
 
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: once_cell::sync::Lazy<Mutex<()>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(()));
+
 pub struct KdeConnectCore {
     device_manager: Arc<DeviceManager>,
     pairing: Arc<PairingManager>,

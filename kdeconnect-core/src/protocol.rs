@@ -11,6 +11,46 @@ use tokio::{fs::File, io::AsyncRead};
 
 pub const PROTOCOL_VERSION: usize = 8;
 
+fn deserialize_packet_id<'de, D>(deserializer: D) -> Result<Option<u128>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Number(id)) => id
+            .as_u64()
+            .map(|id| Some(id as u128))
+            .ok_or_else(|| serde::de::Error::custom("packet id must be an unsigned integer")),
+        Some(Value::String(id)) => id
+            .parse::<u128>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
+        Some(_) => Err(serde::de::Error::custom(
+            "packet id must be a number or numeric string",
+        )),
+    }
+}
+
+fn deserialize_optional_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Number(id)) => id
+            .as_u64()
+            .map(|id| Some(id as usize))
+            .ok_or_else(|| serde::de::Error::custom("value must be an unsigned integer")),
+        Some(Value::String(id)) => id
+            .parse::<usize>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
+        Some(_) => Err(serde::de::Error::custom(
+            "value must be a number or numeric string",
+        )),
+    }
+}
+
 fn serialize_packet_type<S>(pt: &PacketType, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -27,7 +67,7 @@ where
     Ok(PacketType::from(s))
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PacketType {
     Battery,
     BatteryRequest,
@@ -35,6 +75,8 @@ pub enum PacketType {
     ClipboardConnect,
     ConnectivityReport,
     ConnectivityReportRequest,
+    Digitizer,
+    DigitizerSession,
     ContactsRequestAllUidsTimestamps,
     ContactsRequestVcardsByUid,
     ContactsResponseUidsTimestamps,
@@ -85,6 +127,8 @@ impl From<String> for PacketType {
             "kdeconnect.clipboard.connect" => PacketType::ClipboardConnect,
             "kdeconnect.connectivity_report" => PacketType::ConnectivityReport,
             "kdeconnect.connectivity_report.request" => PacketType::ConnectivityReportRequest,
+            "kdeconnect.digitizer" => PacketType::Digitizer,
+            "kdeconnect.digitizer.session" => PacketType::DigitizerSession,
             "kdeconnect.contacts.request_all_uids_timestamps" => {
                 PacketType::ContactsRequestAllUidsTimestamps
             }
@@ -92,6 +136,7 @@ impl From<String> for PacketType {
             | "kdeconnect.contacts.response_all_uids_timestamps" => {
                 PacketType::ContactsResponseUidsTimestamps
             }
+            "kdeconnect.contacts.request_vcards_by_uid" => PacketType::ContactsRequestVcardsByUid,
             "kdeconnect.contacts.response_vcards" => PacketType::ContactsResponseVcards,
             "kdeconnect.findmyphone.request" => PacketType::FindMyPhoneRequest,
             "kdeconnect.lock" => PacketType::Lock,
@@ -144,6 +189,8 @@ impl Display for PacketType {
             PacketType::ConnectivityReportRequest => {
                 write!(f, "kdeconnect.connectivity_report.request")
             }
+            PacketType::Digitizer => write!(f, "kdeconnect.digitizer"),
+            PacketType::DigitizerSession => write!(f, "kdeconnect.digitizer.session"),
             PacketType::ContactsRequestAllUidsTimestamps => {
                 write!(f, "kdeconnect.contacts.request_all_uids_timestamps")
             }
@@ -160,7 +207,7 @@ impl Display for PacketType {
             PacketType::Lock => write!(f, "kdeconnect.lock"),
             PacketType::LockRequest => write!(f, "kdeconnect.lock.request"),
             PacketType::MousePadEcho => write!(f, "kdeconnect.mousepad.echo"),
-            PacketType::MousePadKeyboardState => write!(f, "kdeconnect.mousepad.keyboard_state"),
+            PacketType::MousePadKeyboardState => write!(f, "kdeconnect.mousepad.keyboardstate"),
             PacketType::MousePadRequest => write!(f, "kdeconnect.mousepad.request"),
             PacketType::Mpris => write!(f, "kdeconnect.mpris"),
             PacketType::MprisRequest => write!(f, "kdeconnect.mpris.request"),
@@ -199,6 +246,7 @@ impl Display for PacketType {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ProtocolPacket {
+    #[serde(default, deserialize_with = "deserialize_packet_id")]
     pub id: Option<u128>,
     #[serde(rename = "type")]
     #[serde(
@@ -279,14 +327,103 @@ impl ProtocolPacket {
     }
 
     pub fn from_raw(raw: &[u8]) -> anyhow::Result<Self> {
-        let pkt: ProtocolPacket =
-            serde_json::from_slice(raw).expect("Failed to parse ProtocolPacket from raw data");
-        Ok(pkt)
+        Ok(serde_json::from_slice(raw)?)
     }
 
     pub fn as_raw(&self) -> anyhow::Result<Vec<u8>> {
-        let str = serde_json::to_string(self)?;
-        Ok(format!("{}\n", str).as_bytes().to_vec())
+        let mut buf = serde_json::to_vec(self)?;
+        buf.push(b'\n');
+        Ok(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn packet_type_round_trips_known_protocol_names() {
+        let cases = [
+            (
+                "kdeconnect.contacts.request_vcards_by_uid",
+                PacketType::ContactsRequestVcardsByUid,
+            ),
+            (
+                "kdeconnect.mousepad.keyboardstate",
+                PacketType::MousePadKeyboardState,
+            ),
+        ];
+
+        for (wire_name, packet_type) in cases {
+            assert!(matches!(
+                PacketType::from(wire_name.to_string()),
+                pt if std::mem::discriminant(&pt) == std::mem::discriminant(&packet_type)
+            ));
+            assert_eq!(packet_type.to_string(), wire_name);
+        }
+    }
+
+    #[test]
+    fn from_raw_returns_error_for_invalid_json() {
+        assert!(ProtocolPacket::from_raw(b"not json\n").is_err());
+    }
+
+    #[test]
+    fn packet_id_accepts_kdeconnect_string_timestamp() {
+        let decoded = ProtocolPacket::from_raw(
+            br#"{"id":"1712345678901","type":"kdeconnect.ping","body":{}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.id, Some(1_712_345_678_901));
+        assert!(matches!(decoded.packet_type, PacketType::Ping));
+    }
+
+    #[test]
+    fn packet_serialization_uses_newline_delimited_json() {
+        let packet = ProtocolPacket::new(PacketType::Ping, json!({"message": "hello"}));
+        let raw = packet.as_raw().unwrap();
+        assert_eq!(raw.last(), Some(&b'\n'));
+        let decoded = ProtocolPacket::from_raw(&raw).unwrap();
+        assert!(matches!(decoded.packet_type, PacketType::Ping));
+        assert_eq!(decoded.body["message"], "hello");
+    }
+
+    #[test]
+    fn identity_accepts_android_string_target_protocol_version() {
+        let identity: Identity = serde_json::from_value(json!({
+            "deviceId": "abcdef1234567890abcdef1234567890",
+            "deviceName": "Phone",
+            "deviceType": "phone",
+            "incomingCapabilities": [],
+            "outgoingCapabilities": [],
+            "protocolVersion": 8,
+            "targetDeviceId": "0123456789abcdef0123456789abcdef",
+            "targetProtocolVersion": "8"
+        }))
+        .unwrap();
+
+        assert_eq!(identity.target_protocol_version, Some(8));
+        assert_eq!(
+            identity.target_device_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn pair_packets_only_timestamp_new_requests() {
+        let request = Pair::request();
+        assert!(request.pair);
+        assert!(request.timestamp.is_some());
+
+        let accept = Pair::accept();
+        assert!(accept.pair);
+        assert!(accept.timestamp.is_none());
+
+        let reject = Pair::reject();
+        assert!(!reject.pair);
+        assert!(reject.timestamp.is_none());
     }
 }
 
@@ -300,6 +437,14 @@ pub struct Identity {
     pub outgoing_capabilities: Vec<String>,
     pub protocol_version: usize,
     pub tcp_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_device_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_usize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub target_protocol_version: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Copy, Clone, Debug)]
@@ -310,21 +455,38 @@ pub struct Pair {
 }
 
 impl Pair {
-    pub fn new(response: bool) -> Self {
-        if response {
-            let timestamp = Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            );
-            return Pair {
-                pair: true,
-                timestamp,
-            };
-        }
+    /// Backward-compatible constructor used by upstream callers.
+    #[allow(dead_code)]
+    pub fn new(pair: bool) -> Self {
         Pair {
-            pair: response,
+            pair,
+            timestamp: None,
+        }
+    }
+
+    pub fn request() -> Self {
+        let timestamp = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+        Pair {
+            pair: true,
+            timestamp,
+        }
+    }
+
+    pub fn accept() -> Self {
+        Pair {
+            pair: true,
+            timestamp: None,
+        }
+    }
+
+    pub fn reject() -> Self {
+        Pair {
+            pair: false,
             timestamp: None,
         }
     }
@@ -355,7 +517,7 @@ impl DeviceFile<File> {
         let metadata = file.metadata().await?;
         Ok(DeviceFile {
             buf: file,
-            size: metadata.size().try_into().map_err(std::io::Error::other)?,
+            size: metadata.size(),
         })
     }
 
