@@ -29,7 +29,7 @@ impl Display for DeviceId {
 
 #[derive(Debug, Clone)]
 pub enum DeviceState {
-    Battery { level: u8, charging: bool },
+    Battery { level: i32, charging: bool },
     Connectivity((String, i32)),
 }
 
@@ -46,8 +46,32 @@ pub enum PairState {
 pub struct Device {
     pub name: String,
     pub device_id: DeviceId,
+    #[serde(default = "default_device_type")]
+    pub device_type: String,
+    #[serde(default)]
+    pub incoming_capabilities: Vec<String>,
+    #[serde(default)]
+    pub outgoing_capabilities: Vec<String>,
     pub address: SocketAddr,
     pub pair_state: PairState,
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: usize,
+    /// UNIX timestamp (seconds) from the most recent pairing handshake,
+    /// used for clock-sync validation per the KDE Connect protocol v8+.
+    #[serde(default)]
+    pub pairing_timestamp: u64,
+    /// DER-encoded TLS certificate presented by the peer when pairing.
+    /// Paired LAN devices must keep presenting this certificate on reconnect.
+    #[serde(default)]
+    pub remote_certificate: Vec<u8>,
+}
+
+fn default_protocol_version() -> usize {
+    0
+}
+
+fn default_device_type() -> String {
+    "phone".to_string()
 }
 
 impl Default for Device {
@@ -55,16 +79,37 @@ impl Default for Device {
         Self {
             name: String::new(),
             device_id: DeviceId(String::new()),
+            device_type: default_device_type(),
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
             address: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, DEFAULT_LISTEN_PORT)),
             pair_state: PairState::default(),
+            protocol_version: default_protocol_version(),
+            pairing_timestamp: 0,
+            remote_certificate: Vec::new(),
         }
     }
 }
 
 impl Device {
-    pub async fn new(id: String, name: String, address: SocketAddr) -> anyhow::Result<Self> {
-        let device_id = DeviceId(id);
-        let config_dir = dirs::config_dir().unwrap().join(CONFIG_DIR);
+    /// Legacy constructor for upstream-compatible callers.
+    pub async fn new(id: String, name: String, addr: SocketAddr) -> anyhow::Result<Self> {
+        Self::from_discovery(id, name, "phone".to_string(), vec![], vec![], addr).await
+    }
+
+    pub async fn from_discovery(
+        id: String,
+        name: String,
+        device_type: String,
+        incoming_capabilities: Vec<String>,
+        outgoing_capabilities: Vec<String>,
+        address: SocketAddr,
+    ) -> anyhow::Result<Self> {
+        let device_id = DeviceId(validate_device_id(&id)?);
+        let name = sanitize_device_name(&name);
+        let config_dir = dirs::config_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot find config dir"))?
+            .join(CONFIG_DIR);
         let file_path = config_dir.join(format!("{}.ron", &device_id));
 
         if file_path.exists() {
@@ -72,27 +117,56 @@ impl Device {
             let mut file = fs::File::open(file_path).await?;
             file.read_to_string(&mut buffer).await?;
 
-            return Ok(ron::de::from_str::<Self>(&buffer)?);
+            let mut device = ron::de::from_str::<Self>(&buffer)?;
+            if device.pair_state != PairState::Paired {
+                device.pair_state = PairState::NotPaired;
+                device.pairing_timestamp = 0;
+                device.remote_certificate.clear();
+            }
+            device.name = name;
+            device.address = address;
+            device.device_type = device_type;
+            device.incoming_capabilities = incoming_capabilities;
+            device.outgoing_capabilities = outgoing_capabilities;
+            return Ok(device);
         }
 
         Ok(Self {
             name,
             device_id,
+            device_type,
+            incoming_capabilities,
+            outgoing_capabilities,
             address,
             pair_state: PairState::NotPaired,
+            protocol_version: 0,
+            pairing_timestamp: 0,
+            remote_certificate: Vec::new(),
         })
     }
 
     pub async fn store_device_identity(&self, pair_state: PairState) -> anyhow::Result<()> {
         let mut data = self.clone();
-        data.pair_state = pair_state;
+        data.pair_state = if pair_state == PairState::Paired {
+            PairState::Paired
+        } else {
+            PairState::NotPaired
+        };
+        if data.pair_state == PairState::NotPaired {
+            data.remote_certificate.clear();
+            data.pairing_timestamp = 0;
+        }
 
         if let Ok(file_content) = ron::ser::to_string_pretty(&data, PrettyConfig::new()) {
-            let config_dir = dirs::config_dir().unwrap().join(CONFIG_DIR);
+            let config_dir = dirs::config_dir()
+                .ok_or_else(|| anyhow::anyhow!("cannot find config dir"))?
+                .join(CONFIG_DIR);
             let file_path = config_dir.join(format!("{}.ron", self.device_id));
 
-            if file_path.exists() {
-                fs::remove_file(&file_path).await?
+            if let Err(e) = fs::remove_file(&file_path).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(e.into());
             }
 
             let mut file = fs::File::create(file_path).await?;
@@ -109,7 +183,7 @@ impl Device {
 #[derive(Debug, Clone)]
 pub struct DeviceManager {
     devices: Arc<RwLock<HashMap<DeviceId, Device>>>,
-    event_tx: mpsc::UnboundedSender<CoreEvent>,
+    pub(crate) event_tx: mpsc::UnboundedSender<CoreEvent>,
 }
 
 impl DeviceManager {
@@ -120,9 +194,18 @@ impl DeviceManager {
         }
     }
 
-    pub async fn add_or_update_device(&self, device_id: DeviceId, device: Device) {
+    pub async fn add_or_update_device(&self, device_id: DeviceId, mut device: Device) {
         info!("updating: {}", device_id);
         let mut guard = self.devices.write().await;
+        if let Some(existing) = guard.get(&device_id)
+            && matches!(
+                existing.pair_state,
+                PairState::Requesting | PairState::Requested
+            )
+            && device.pair_state == PairState::NotPaired
+        {
+            device.pair_state = existing.pair_state;
+        }
         guard.entry(device_id).insert_entry(device.clone());
     }
 
@@ -137,35 +220,394 @@ impl DeviceManager {
     }
 
     pub async fn set_paired(&self, id: &DeviceId, flag: bool) {
-        let mut guard = self.devices.write().await;
+        let device_clone = {
+            let mut guard = self.devices.write().await;
 
-        if let Some(device) = guard.get_mut(id) {
+            let Some(device) = guard.get_mut(id) else {
+                return;
+            };
+
             if flag {
                 device.pair_state = PairState::Paired;
                 let _ = self.event_tx.send(CoreEvent::DevicePaired((
                     device.device_id.clone(),
                     device.clone(),
                 )));
-                let _ = device.update_pair_state(PairState::Paired).await;
             } else {
                 device.pair_state = PairState::NotPaired;
+                device.remote_certificate.clear();
                 let _ = self
                     .event_tx
                     .send(CoreEvent::DevicePairCancelled(device.device_id.clone()));
-                let _ = device.update_pair_state(PairState::NotPaired).await;
             }
-        }
+            device.clone()
+        };
+
+        let state = if flag {
+            PairState::Paired
+        } else {
+            PairState::NotPaired
+        };
+        device_clone.update_pair_state(state).await;
     }
 
     pub async fn update_pair_state(&self, id: &DeviceId, state: PairState) {
-        let mut guard = self.devices.write().await;
+        let device_clone = {
+            let mut guard = self.devices.write().await;
 
-        if let Some(device) = guard.get_mut(id) {
+            let Some(device) = guard.get_mut(id) else {
+                return;
+            };
             device.pair_state = state;
+            if state == PairState::NotPaired {
+                device.remote_certificate.clear();
+            }
             let _ = self
                 .event_tx
                 .send(CoreEvent::DevicePairStateChanged((id.clone(), state)));
-            let _ = device.update_pair_state(state).await;
+            device.clone()
+        };
+
+        device_clone.update_pair_state(state).await;
+    }
+
+    pub async fn set_protocol_version(&self, id: &DeviceId, version: usize) {
+        let mut paired_device_to_store = None;
+        {
+            let mut guard = self.devices.write().await;
+            if let Some(device) = guard.get_mut(id) {
+                if device.protocol_version == version {
+                    return;
+                }
+                device.protocol_version = version;
+                if device.pair_state == PairState::Paired {
+                    paired_device_to_store = Some(device.clone());
+                }
+            }
         }
+
+        if let Some(device) = paired_device_to_store {
+            let _ = device.store_device_identity(PairState::Paired).await;
+        }
+    }
+
+    pub async fn set_pairing_timestamp(&self, id: &DeviceId, timestamp: u64) {
+        let mut guard = self.devices.write().await;
+        if let Some(device) = guard.get_mut(id) {
+            device.pairing_timestamp = timestamp;
+        }
+    }
+
+    pub async fn get_pairing_timestamp(&self, id: &DeviceId) -> u64 {
+        let guard = self.devices.read().await;
+        guard.get(id).map(|d| d.pairing_timestamp).unwrap_or(0)
+    }
+}
+
+/// Validate a device ID per the KDE Connect protocol.
+/// Must match `^[a-zA-Z0-9_-]{32,38}$` (32-38 alphanumeric chars, hyphens, underscores).
+pub fn validate_device_id(id: &str) -> anyhow::Result<String> {
+    if id.len() < 32
+        || id.len() > 38
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(anyhow::anyhow!(
+            "Invalid device ID '{}': must be 32-38 alphanumeric characters, underscores, or hyphens",
+            id
+        ));
+    }
+    Ok(id.to_string())
+}
+
+/// Sanitize a device name by removing forbidden characters.
+/// Valid names contain only characters that are NOT in the set: `"',;:.!?()[]<>`
+/// and must be 1-32 characters after trimming.
+pub fn sanitize_device_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '"' | '\'' | ',' | ';' | ':' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '<' | '>'
+            )
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    if sanitized.is_empty() {
+        "Unknown Device".to_string()
+    } else if sanitized.chars().count() > 32 {
+        sanitized.chars().take(32).collect()
+    } else {
+        sanitized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    async fn setup_test_env() -> (tokio::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+        let guard = crate::TEST_ENV_LOCK.lock().await;
+        let td = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", td.path());
+        }
+        tokio::fs::create_dir_all(td.path().join(".config").join(crate::config::CONFIG_DIR))
+            .await
+            .unwrap();
+        (guard, td)
+    }
+
+    #[test]
+    fn sanitizes_long_unicode_device_names_without_panicking() {
+        let name = sanitize_device_name(
+            "電話電話電話電話電話電話電話電話電話電話電話電話電話電話電話電話電話",
+        );
+
+        assert_eq!(name.chars().count(), 32);
+    }
+
+    #[test]
+    fn sanitize_removes_forbidden_characters() {
+        assert_eq!(sanitize_device_name("Phone's \"Test\""), "Phones Test");
+        assert_eq!(sanitize_device_name("Phone;Drop"), "PhoneDrop");
+        assert_eq!(sanitize_device_name("<script>"), "script");
+    }
+
+    #[test]
+    fn sanitize_empty_name_returns_unknown() {
+        assert_eq!(sanitize_device_name(""), "Unknown Device");
+        assert_eq!(sanitize_device_name("..."), "Unknown Device");
+        assert_eq!(sanitize_device_name("   "), "Unknown Device");
+    }
+
+    #[test]
+    fn validate_device_id_rejects_short_ids() {
+        assert!(validate_device_id("short").is_err());
+        assert!(validate_device_id("abc").is_err());
+    }
+
+    #[test]
+    fn validate_device_id_rejects_long_ids() {
+        let long_id = "a".repeat(39);
+        assert!(validate_device_id(&long_id).is_err());
+    }
+
+    #[test]
+    fn validate_device_id_rejects_special_chars() {
+        assert!(validate_device_id("abcdef1234567890abcdef12345678/0").is_err());
+        assert!(validate_device_id("abcdef1234567890abcdef1234567..0").is_err());
+        assert!(validate_device_id("abcdef1234567890abcdef12345678 0").is_err());
+    }
+
+    #[test]
+    fn validate_device_id_accepts_valid_ids() {
+        assert!(validate_device_id("abcdef1234567890abcdef1234567890").is_ok());
+        assert!(validate_device_id("ABCDEF-1234_5678-abcdef123456789").is_ok());
+    }
+
+    #[tokio::test]
+    async fn device_manager_add_and_get() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let dm = DeviceManager::new(tx);
+
+        let id = DeviceId("test-device-mgr-add-00000000000000".to_string());
+        let device = Device {
+            device_id: id.clone(),
+            name: "Test Phone".to_string(),
+            ..Default::default()
+        };
+
+        dm.add_or_update_device(id.clone(), device.clone()).await;
+
+        let retrieved = dm.get_device(&id).await;
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().name, "Test Phone");
+    }
+
+    #[tokio::test]
+    async fn device_manager_set_paired_emits_event() {
+        let (_guard, _td) = setup_test_env().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let dm = DeviceManager::new(tx);
+
+        let id = DeviceId("test-device-pair-emit-0000000000".to_string());
+        let device = Device {
+            device_id: id.clone(),
+            ..Default::default()
+        };
+        dm.add_or_update_device(id.clone(), device).await;
+
+        dm.set_paired(&id, true).await;
+
+        let dev = dm.get_device(&id).await.unwrap();
+        assert_eq!(dev.pair_state, PairState::Paired);
+
+        let event = rx.try_recv();
+        assert!(event.is_ok());
+    }
+
+    #[tokio::test]
+    async fn device_manager_update_pair_state() {
+        let (_guard, _td) = setup_test_env().await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let dm = DeviceManager::new(tx);
+
+        let id = DeviceId("test-device-state-up-0000000000".to_string());
+        let device = Device {
+            device_id: id.clone(),
+            ..Default::default()
+        };
+        dm.add_or_update_device(id.clone(), device).await;
+
+        dm.update_pair_state(&id, PairState::Requesting).await;
+        assert_eq!(
+            dm.get_device(&id).await.unwrap().pair_state,
+            PairState::Requesting
+        );
+
+        dm.update_pair_state(&id, PairState::Paired).await;
+        assert_eq!(
+            dm.get_device(&id).await.unwrap().pair_state,
+            PairState::Paired
+        );
+
+        dm.update_pair_state(&id, PairState::NotPaired).await;
+        let dev = dm.get_device(&id).await.unwrap();
+        assert_eq!(dev.pair_state, PairState::NotPaired);
+        assert!(dev.remote_certificate.is_empty());
+    }
+
+    #[tokio::test]
+    async fn device_manager_preserves_transient_pair_state_on_identity_refresh() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let dm = DeviceManager::new(tx);
+
+        let id = DeviceId("transient-refresh-device".to_string());
+        let requesting = Device {
+            device_id: id.clone(),
+            pair_state: PairState::Requesting,
+            ..Default::default()
+        };
+        dm.add_or_update_device(id.clone(), requesting).await;
+
+        let refreshed = Device {
+            device_id: id.clone(),
+            pair_state: PairState::NotPaired,
+            ..Default::default()
+        };
+        dm.add_or_update_device(id.clone(), refreshed).await;
+
+        assert_eq!(
+            dm.get_device(&id).await.unwrap().pair_state,
+            PairState::Requesting
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_pair_states_are_not_persisted_or_reloaded() {
+        let (_guard, td) = setup_test_env().await;
+        let config_dir = td.path().join(".config").join(crate::config::CONFIG_DIR);
+
+        let raw_id = "transientdevice00000000000000000";
+        let device = Device {
+            name: "Test Phone".to_string(),
+            device_id: DeviceId(raw_id.to_string()),
+            pair_state: PairState::Requesting,
+            pairing_timestamp: 1234567890,
+            remote_certificate: vec![1, 2, 3],
+            ..Default::default()
+        };
+
+        device
+            .store_device_identity(PairState::Requesting)
+            .await
+            .unwrap();
+        let stored = tokio::fs::read_to_string(config_dir.join(format!("{}.ron", raw_id)))
+            .await
+            .unwrap();
+        let stored_device = ron::de::from_str::<Device>(&stored).unwrap();
+        assert_eq!(stored_device.pair_state, PairState::NotPaired);
+        assert_eq!(stored_device.pairing_timestamp, 0);
+        assert!(stored_device.remote_certificate.is_empty());
+
+        let loaded = Device::from_discovery(
+            raw_id.to_string(),
+            "Loaded Phone".to_string(),
+            "phone".to_string(),
+            vec![],
+            vec![],
+            Device::default().address,
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.pair_state, PairState::NotPaired);
+        assert_eq!(loaded.pairing_timestamp, 0);
+        assert!(loaded.remote_certificate.is_empty());
+    }
+
+    #[tokio::test]
+    async fn device_manager_unpair_clears_certificate() {
+        let (_guard, _td) = setup_test_env().await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let dm = DeviceManager::new(tx);
+
+        let id = DeviceId("test-device-cert-clr-0000000000".to_string());
+        let device = Device {
+            device_id: id.clone(),
+            pair_state: PairState::Paired,
+            remote_certificate: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+        dm.add_or_update_device(id.clone(), device).await;
+
+        dm.set_paired(&id, false).await;
+
+        let dev = dm.get_device(&id).await.unwrap();
+        assert_eq!(dev.pair_state, PairState::NotPaired);
+        assert!(dev.remote_certificate.is_empty());
+    }
+
+    #[tokio::test]
+    async fn device_manager_protocol_version_and_timestamp() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let dm = DeviceManager::new(tx);
+
+        let id = DeviceId("test-device-version-0000000000000".to_string());
+        let device = Device {
+            device_id: id.clone(),
+            ..Default::default()
+        };
+        dm.add_or_update_device(id.clone(), device).await;
+
+        dm.set_protocol_version(&id, 8).await;
+        assert_eq!(dm.get_device(&id).await.unwrap().protocol_version, 8);
+
+        dm.set_pairing_timestamp(&id, 1234567890).await;
+        assert_eq!(dm.get_pairing_timestamp(&id).await, 1234567890);
+    }
+
+    #[tokio::test]
+    async fn device_manager_get_devices_returns_all() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let dm = DeviceManager::new(tx);
+
+        for i in 0..3 {
+            let id = DeviceId(format!("test-device-list-{:02}-000000000000", i));
+            let device = Device {
+                device_id: id.clone(),
+                name: format!("Phone {}", i),
+                ..Default::default()
+            };
+            dm.add_or_update_device(id, device).await;
+        }
+
+        let devices = dm.get_devices().await;
+        assert_eq!(devices.len(), 3);
     }
 }

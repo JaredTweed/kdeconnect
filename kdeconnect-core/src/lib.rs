@@ -106,6 +106,7 @@ impl KdeConnectCore {
         let sms_plugin = plugins::sms::SmsMessages {
             messages: Vec::new(),
             version: None,
+            device_id: None,
         };
         plugin_registry.register(Arc::new(sms_plugin)).await;
 
