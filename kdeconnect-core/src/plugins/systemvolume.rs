@@ -9,7 +9,10 @@ use libpulse_binding::{
     volume::{ChannelVolumes, Volume},
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -72,6 +75,7 @@ enum PaMessage {
 #[derive(Clone)]
 struct PaConnection {
     tx: mpsc::UnboundedSender<PaMessage>,
+    generation: u64,
 }
 
 impl PaConnection {
@@ -83,6 +87,7 @@ impl PaConnection {
 // Global map: device_id → PA connection handle.
 static PA_CONNECTIONS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, PaConnection>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static PA_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -90,10 +95,18 @@ static PA_CONNECTIONS: std::sync::LazyLock<Mutex<std::collections::HashMap<Strin
 
 impl SystemVolumeRequest {
     pub async fn handle(&self, device: &Device, _core_tx: mpsc::UnboundedSender<CoreEvent>) {
-        info!("[systemvolume] handle called: request_sinks={:?} name={:?} volume={:?} muted={:?}",
-            self.request_sinks, self.name, self.volume, self.muted);
+        info!(
+            "[systemvolume] handle called: request_sinks={:?} name={:?} volume={:?} muted={:?}",
+            self.request_sinks, self.name, self.volume, self.muted
+        );
         let conn = {
-            let map = PA_CONNECTIONS.lock().unwrap();
+            let map = match PA_CONNECTIONS.lock() {
+                Ok(m) => m,
+                Err(_) => {
+                    warn!("[systemvolume] PA_CONNECTIONS mutex poisoned");
+                    return;
+                }
+            };
             map.get(&device.device_id.0).cloned()
         };
 
@@ -126,10 +139,17 @@ pub fn on_device_connect(device_id: DeviceId, core_tx: mpsc::UnboundedSender<Cor
     info!("[systemvolume] on_device_connect for {}", device_id.0);
 
     let (tx, rx) = mpsc::unbounded_channel::<PaMessage>();
-    let conn = PaConnection { tx };
+    let generation = PA_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let conn = PaConnection { tx, generation };
 
     {
-        let mut map = PA_CONNECTIONS.lock().unwrap();
+        let mut map = match PA_CONNECTIONS.lock() {
+            Ok(m) => m,
+            Err(_) => {
+                warn!("[systemvolume] PA_CONNECTIONS mutex poisoned in on_device_connect");
+                return;
+            }
+        };
         // Drop the old sender — this closes the old thread's channel, causing it to exit cleanly.
         map.remove(&device_id.0);
         map.insert(device_id.0.clone(), conn);
@@ -138,10 +158,31 @@ pub fn on_device_connect(device_id: DeviceId, core_tx: mpsc::UnboundedSender<Cor
     let did = device_id.clone();
     std::thread::spawn(move || {
         pa_thread(did.clone(), core_tx, rx);
-        let mut map = PA_CONNECTIONS.lock().unwrap();
-        map.remove(&did.0);
+        if let Ok(mut map) = PA_CONNECTIONS.lock()
+            && map
+                .get(&did.0)
+                .map(|conn| conn.generation == generation)
+                .unwrap_or(false)
+        {
+            map.remove(&did.0);
+        }
         info!("[systemvolume] PA thread exited for {}", did.0);
     });
+}
+
+pub fn on_device_disconnect(device_id: &DeviceId) {
+    let conn = match PA_CONNECTIONS.lock() {
+        Ok(mut map) => map.remove(&device_id.0),
+        Err(_) => {
+            warn!("[systemvolume] PA_CONNECTIONS mutex poisoned in on_device_disconnect");
+            None
+        }
+    };
+
+    if let Some(conn) = conn {
+        conn.send(PaMessage::Quit);
+        info!("[systemvolume] stopped PA thread for {}", device_id.0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,11 +281,11 @@ fn pa_thread(
         // Subscribe to sink changes — signal ourselves via the message channel.
         let did_sub = device_id.clone();
         context.set_subscribe_callback(Some(Box::new(move |facility, _op, _index| {
-            if facility == Some(Facility::Sink) {
-                let map = PA_CONNECTIONS.lock().unwrap();
-                if let Some(conn) = map.get(&did_sub.0) {
-                    conn.send(PaMessage::GetSinks);
-                }
+            if facility == Some(Facility::Sink)
+                && let Ok(map) = PA_CONNECTIONS.lock()
+                && let Some(conn) = map.get(&did_sub.0)
+            {
+                conn.send(PaMessage::GetSinks);
             }
         })));
         context.subscribe(InterestMaskSet::SINK, |_| {});
@@ -308,7 +349,7 @@ fn pa_thread(
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
                     // Nothing pending — yield briefly.
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(std::time::Duration::from_millis(250));
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     info!(
@@ -336,9 +377,9 @@ fn enumerate_sinks(mainloop: &mut Mainloop, context: &Context) -> Option<Vec<Sin
     mainloop.lock();
     let introspect = context.introspect();
     let op = introspect.get_server_info(move |info| {
-        *default_sink_cb.lock().unwrap() = info.default_sink_name
-            .as_deref()
-            .map(|s| s.to_string());
+        if let Ok(mut guard) = default_sink_cb.lock() {
+            *guard = info.default_sink_name.as_deref().map(|s| s.to_string());
+        }
     });
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -353,7 +394,13 @@ fn enumerate_sinks(mainloop: &mut Mainloop, context: &Context) -> Option<Vec<Sin
     }
     mainloop.unlock();
 
-    let default_name = default_sink.lock().unwrap().clone();
+    let default_name = match default_sink.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => {
+            warn!("[systemvolume] default_sink mutex poisoned");
+            return None;
+        }
+    };
     info!("[systemvolume] default sink: {:?}", default_name);
 
     // Now enumerate sinks.
@@ -363,10 +410,11 @@ fn enumerate_sinks(mainloop: &mut Mainloop, context: &Context) -> Option<Vec<Sin
 
     mainloop.lock();
     let op = introspect.get_sink_info_list(move |result| {
-        if let ListResult::Item(info) = result {
-            if let Some(sink) = pa_sink_to_info(info, &default_name_cb) {
-                sinks_cb.lock().unwrap().push(sink);
-            }
+        if let ListResult::Item(info) = result
+            && let Some(sink) = pa_sink_to_info(info, &default_name_cb)
+            && let Ok(mut guard) = sinks_cb.lock()
+        {
+            guard.push(sink);
         }
     });
 
@@ -393,27 +441,40 @@ fn set_volume(mainloop: &mut Mainloop, context: &Context, name: &str, volume: u3
     mainloop.lock();
     let mut introspect = context.introspect();
     let op = introspect.get_sink_info_by_name(name, move |result| {
-        if let ListResult::Item(info) = result {
-            *channels_cb.lock().unwrap() = info.channel_map.len() as u8;
+        if let ListResult::Item(info) = result
+            && let Ok(mut guard) = channels_cb.lock()
+        {
+            *guard = info.channel_map.len();
         }
     });
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while op.get_state() == libpulse_binding::operation::State::Running {
-        if std::time::Instant::now() > deadline { break; }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
         mainloop.unlock();
         std::thread::sleep(std::time::Duration::from_millis(50));
         mainloop.lock();
     }
 
-    let ch = *channels.lock().unwrap();
+    let ch = match channels.lock() {
+        Ok(g) => *g,
+        Err(_) => {
+            warn!("[systemvolume] channels mutex poisoned");
+            mainloop.unlock();
+            return;
+        }
+    };
     let mut cvol = ChannelVolumes::default();
     cvol.set(ch, Volume(volume));
 
     let op = introspect.set_sink_volume_by_name(name, &cvol, None::<Box<dyn FnMut(bool)>>);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while op.get_state() == libpulse_binding::operation::State::Running {
-        if std::time::Instant::now() > deadline { break; }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
         mainloop.unlock();
         std::thread::sleep(std::time::Duration::from_millis(50));
         mainloop.lock();
@@ -427,7 +488,9 @@ fn set_mute(mainloop: &mut Mainloop, context: &Context, name: &str, muted: bool)
     let op = introspect.set_sink_mute_by_name(name, muted, None::<Box<dyn FnMut(bool)>>);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while op.get_state() == libpulse_binding::operation::State::Running {
-        if std::time::Instant::now() > deadline { break; }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
         mainloop.unlock();
         std::thread::sleep(std::time::Duration::from_millis(50));
         mainloop.lock();
@@ -443,7 +506,13 @@ fn pa_sink_to_info(info: &PASinkInfo, default_sink: &Option<String>) -> Option<S
     let name = info.name.as_deref()?.to_string();
     let description = info.description.as_deref().unwrap_or(&name).to_string();
     let enabled = default_sink.as_deref() == Some(name.as_str());
-    info!("[systemvolume] sink '{}' volume={} max={} enabled={}", name, info.volume.avg().0, MAX_VOLUME, enabled);
+    info!(
+        "[systemvolume] sink '{}' volume={} max={} enabled={}",
+        name,
+        info.volume.avg().0,
+        MAX_VOLUME,
+        enabled
+    );
     Some(SinkInfo {
         name,
         description,
