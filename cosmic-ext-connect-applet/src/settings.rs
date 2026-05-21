@@ -11,9 +11,12 @@ use cosmic::{
 use cosmic_ext_connect_applet::{backend, models::Device};
 use futures::StreamExt as _;
 use std::collections::HashMap;
+use std::time::Instant;
 
 /// A desktop command stored as JSON: {id, name, command}
 type LocalCommand = serde_json::Value;
+
+const PAIRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
 
 fn run_commands_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -50,84 +53,102 @@ struct PluginInfo {
 
 fn implemented_plugins() -> Vec<PluginInfo> {
     vec![
-    PluginInfo {
-        id: "battery",
-        name: fl!("plugin-battery-name"),
-        description: fl!("plugin-battery-desc"),
-        icon: "battery-full-symbolic",
-    },
-    PluginInfo {
-        id: "clipboard",
-        name: fl!("plugin-clipboard-name"),
-        description: fl!("plugin-clipboard-desc"),
-        icon: "edit-paste-symbolic",
-    },
-    PluginInfo {
-        id: "connectivity_report",
-        name: fl!("plugin-connectivity-name"),
-        description: fl!("plugin-connectivity-desc"),
-        icon: "network-cellular-symbolic",
-    },
-    PluginInfo {
-        id: "contacts",
-        name: fl!("plugin-contacts-name"),
-        description: fl!("plugin-contacts-desc"),
-        icon: "x-office-address-book-symbolic",
-    },
-    PluginInfo {
-        id: "findmyphone",
-        name: fl!("plugin-findmyphone-name"),
-        description: fl!("plugin-findmyphone-desc"),
-        icon: "audio-speakers-symbolic",
-    },
-    PluginInfo {
-        id: "mpris",
-        name: fl!("plugin-mpris-name"),
-        description: fl!("plugin-mpris-desc"),
-        icon: "media-playback-start-symbolic",
-    },
-    PluginInfo {
-        id: "notification",
-        name: fl!("plugin-notifications-name"),
-        description: fl!("plugin-notifications-desc"),
-        icon: "preferences-system-notifications-symbolic",
-    },
-    PluginInfo {
-        id: "ping",
-        name: fl!("plugin-ping-name"),
-        description: fl!("plugin-ping-desc"),
-        icon: "network-transmit-receive-symbolic",
-    },
-    PluginInfo {
-        id: "runcommand",
-        name: fl!("plugin-runcommand-name"),
-        description: fl!("plugin-runcommand-desc"),
-        icon: "utilities-terminal-symbolic",
-    },
-    PluginInfo {
-        id: "share",
-        name: fl!("plugin-share-name"),
-        description: fl!("plugin-share-desc"),
-        icon: "document-send-symbolic",
-    },
-    PluginInfo {
-        id: "sms",
-        name: fl!("plugin-sms-name"),
-        description: fl!("plugin-sms-desc"),
-        icon: "mail-message-new-symbolic",
-    },
-    PluginInfo {
-        id: "systemvolume",
-        name: fl!("plugin-systemvolume-name"),
-        description: fl!("plugin-systemvolume-desc"),
-        icon: "audio-volume-high-symbolic",
-    },
-    PluginInfo {
-        id: "telephony",
-        name: fl!("plugin-telephony-name"),
-        description: fl!("plugin-telephony-desc"),
-        icon: "phone-symbolic",
-    },
+        PluginInfo {
+            id: "battery",
+            name: fl!("plugin-battery-name"),
+            description: fl!("plugin-battery-desc"),
+            icon: "battery-full-symbolic",
+        },
+        PluginInfo {
+            id: "clipboard",
+            name: fl!("plugin-clipboard-name"),
+            description: fl!("plugin-clipboard-desc"),
+            icon: "edit-paste-symbolic",
+        },
+        PluginInfo {
+            id: "connectivity_report",
+            name: fl!("plugin-connectivity-name"),
+            description: fl!("plugin-connectivity-desc"),
+            icon: "network-cellular-symbolic",
+        },
+        PluginInfo {
+            id: "contacts",
+            name: fl!("plugin-contacts-name"),
+            description: fl!("plugin-contacts-desc"),
+            icon: "x-office-address-book-symbolic",
+        },
+        PluginInfo {
+            id: "findmyphone",
+            name: fl!("plugin-findmyphone-name"),
+            description: fl!("plugin-findmyphone-desc"),
+            icon: "audio-speakers-symbolic",
+        },
+        PluginInfo {
+            id: "mpris",
+            name: fl!("plugin-mpris-name"),
+            description: fl!("plugin-mpris-desc"),
+            icon: "media-playback-start-symbolic",
+        },
+        PluginInfo {
+            id: "mousepad",
+            name: fl!("plugin-mousepad-name"),
+            description: fl!("plugin-mousepad-desc"),
+            icon: "input-mouse-symbolic",
+        },
+        PluginInfo {
+            id: "notification",
+            name: fl!("plugin-notifications-name"),
+            description: fl!("plugin-notifications-desc"),
+            icon: "preferences-system-notifications-symbolic",
+        },
+        PluginInfo {
+            id: "ping",
+            name: fl!("plugin-ping-name"),
+            description: fl!("plugin-ping-desc"),
+            icon: "network-transmit-receive-symbolic",
+        },
+        PluginInfo {
+            id: "presenter",
+            name: fl!("plugin-presenter-name"),
+            description: fl!("plugin-presenter-desc"),
+            icon: "x-office-presentation-symbolic",
+        },
+        PluginInfo {
+            id: "runcommand",
+            name: fl!("plugin-runcommand-name"),
+            description: fl!("plugin-runcommand-desc"),
+            icon: "utilities-terminal-symbolic",
+        },
+        PluginInfo {
+            id: "share",
+            name: fl!("plugin-share-name"),
+            description: fl!("plugin-share-desc"),
+            icon: "document-send-symbolic",
+        },
+        PluginInfo {
+            id: "sftp",
+            name: fl!("plugin-sftp-name"),
+            description: fl!("plugin-sftp-desc"),
+            icon: "folder-remote-symbolic",
+        },
+        PluginInfo {
+            id: "sms",
+            name: fl!("plugin-sms-name"),
+            description: fl!("plugin-sms-desc"),
+            icon: "mail-message-new-symbolic",
+        },
+        PluginInfo {
+            id: "systemvolume",
+            name: fl!("plugin-systemvolume-name"),
+            description: fl!("plugin-systemvolume-desc"),
+            icon: "audio-volume-high-symbolic",
+        },
+        PluginInfo {
+            id: "telephony",
+            name: fl!("plugin-telephony-name"),
+            description: fl!("plugin-telephony-desc"),
+            icon: "phone-symbolic",
+        },
     ]
 }
 
@@ -156,6 +177,8 @@ pub enum Message {
     TogglePlugin(String, bool),
     Refresh,
     PairDevice(String),
+    PairDeviceFinished(String, Result<(), String>, Vec<Device>),
+    PairingExpired(String),
     UnpairDevice(String),
     /// Fired by the D-Bus event subscription whenever a device connects or pairs.
     ServiceEvent(kdeconnect_dbus_client::ServiceEvent),
@@ -178,7 +201,7 @@ pub struct SettingsApp {
     selected_device: Option<String>,
     /// device_id → (plugin_id → enabled)
     plugin_states: HashMap<String, HashMap<String, bool>>,
-    pairing_in_progress: HashMap<String, bool>,
+    pairing_in_progress: HashMap<String, Instant>,
     /// Desktop commands manageable from the Run Command section
     run_commands: Vec<LocalCommand>,
     new_cmd_name: String,
@@ -186,6 +209,39 @@ pub struct SettingsApp {
 }
 
 impl SettingsApp {
+    fn apply_devices_loaded(&mut self, devices: Vec<Device>) -> Option<String> {
+        if let Some(sel) = self.selected_device.clone() {
+            let still_paired = devices.iter().any(|d| d.id == sel && d.is_paired);
+            if !still_paired {
+                self.plugin_states.remove(&sel);
+                self.selected_device = None;
+            }
+        }
+        let prev = self.selected_device.clone();
+        if self.selected_device.is_none() {
+            self.selected_device = devices.iter().find(|d| d.is_paired).map(|d| d.id.clone());
+        }
+        for d in &devices {
+            if d.is_paired {
+                self.pairing_in_progress.remove(&d.id);
+            }
+        }
+        self.pairing_in_progress.retain(|id, started| {
+            let still_actionable = devices
+                .iter()
+                .any(|d| d.id == *id && !d.is_paired && d.is_reachable);
+            let within_timeout = started.elapsed() < PAIRING_TIMEOUT;
+            still_actionable && within_timeout
+        });
+        self.devices = devices;
+
+        if self.selected_device != prev {
+            self.selected_device.clone()
+        } else {
+            None
+        }
+    }
+
     fn plugin_enabled(&self, plugin_id: &str) -> bool {
         self.selected_device
             .as_ref()
@@ -242,7 +298,10 @@ impl Application for SettingsApp {
 
         let title_task = app.set_window_title(
             fl!("settings-title").to_string(),
-            app.core.main_window_id().unwrap(),
+            app.core.main_window_id().unwrap_or_else(|| {
+                eprintln!("[settings] main_window_id not available yet");
+                cosmic::iced::window::Id::unique()
+            }),
         );
 
         let load_task = Task::perform(
@@ -255,10 +314,9 @@ impl Application for SettingsApp {
             |devices| Action::App(Message::DevicesLoaded(devices)),
         );
 
-        let cmds_task = Task::perform(
-            async { load_run_commands() },
-            |cmds| Action::App(Message::RunCommandsLoaded(cmds)),
-        );
+        let cmds_task = Task::perform(async { load_run_commands() }, |cmds| {
+            Action::App(Message::RunCommandsLoaded(cmds))
+        });
 
         (app, Task::batch(vec![title_task, load_task, cmds_task]))
     }
@@ -279,31 +337,8 @@ impl Application for SettingsApp {
     fn update(&mut self, message: Self::Message) -> Task<Action<Self::Message>> {
         match message {
             Message::DevicesLoaded(devices) => {
-                if let Some(sel) = self.selected_device.clone() {
-                    // Clear selection if the device is gone or no longer paired.
-                    let still_paired = devices.iter().any(|d| d.id == sel && d.is_paired);
-                    if !still_paired {
-                        self.plugin_states.remove(&sel);
-                        self.selected_device = None;
-                    }
-                }
-                let prev = self.selected_device.clone();
-                if self.selected_device.is_none() {
-                    self.selected_device =
-                        devices.iter().find(|d| d.is_paired).map(|d| d.id.clone());
-                }
-                for d in &devices {
-                    if d.is_paired {
-                        self.pairing_in_progress.remove(&d.id);
-                    }
-                }
-                self.devices = devices;
-
-                // Load plugin states if we auto-selected a new device
-                if self.selected_device != prev {
-                    if let Some(did) = self.selected_device.clone() {
-                        return Self::load_plugin_states_task(did);
-                    }
+                if let Some(did) = self.apply_devices_loaded(devices) {
+                    return Self::load_plugin_states_task(did);
                 }
             }
 
@@ -319,10 +354,9 @@ impl Application for SettingsApp {
                 let trigger_broadcast = tab == Tab::AvailableDevices;
                 self.active_tab = tab;
                 if trigger_broadcast {
-                    return Task::perform(
-                        async { backend::fetch_devices().await },
-                        |devices| Action::App(Message::DevicesLoaded(devices)),
-                    );
+                    return Task::perform(async { backend::scan_devices().await }, |devices| {
+                        Action::App(Message::DevicesLoaded(devices))
+                    });
                 }
             }
 
@@ -349,9 +383,7 @@ impl Application for SettingsApp {
                     let pid = plugin_id;
                     return Task::perform(
                         async move {
-                            if let Err(e) =
-                                backend::set_plugin_enabled(did, pid, enabled).await
-                            {
+                            if let Err(e) = backend::set_plugin_enabled(did, pid, enabled).await {
                                 eprintln!("[settings] set_plugin_enabled failed: {:?}", e);
                             }
                         },
@@ -361,22 +393,55 @@ impl Application for SettingsApp {
             }
 
             Message::Refresh => {
-                return Task::perform(
-                    async { backend::fetch_devices().await },
-                    |devices| Action::App(Message::DevicesLoaded(devices)),
-                );
+                return Task::perform(async { backend::scan_devices().await }, |devices| {
+                    Action::App(Message::DevicesLoaded(devices))
+                });
             }
 
             Message::PairDevice(device_id) => {
-                self.pairing_in_progress.insert(device_id.clone(), true);
-                let id = device_id;
-                return Task::perform(
-                    async move {
-                        backend::pair_device(id).await.ok();
-                        backend::fetch_devices().await
-                    },
-                    |devices| Action::App(Message::DevicesLoaded(devices)),
-                );
+                self.pairing_in_progress
+                    .insert(device_id.clone(), Instant::now());
+                let pair_id = device_id.clone();
+                let timeout_id = device_id;
+                return Task::batch(vec![
+                    Task::perform(
+                        async move {
+                            let result = backend::pair_device(pair_id.clone())
+                                .await
+                                .map_err(|e| e.to_string());
+                            let devices = backend::fetch_devices().await;
+                            (pair_id, result, devices)
+                        },
+                        |(id, result, devices)| {
+                            Action::App(Message::PairDeviceFinished(id, result, devices))
+                        },
+                    ),
+                    Task::perform(
+                        async move {
+                            tokio::time::sleep(PAIRING_TIMEOUT).await;
+                            timeout_id
+                        },
+                        |id| Action::App(Message::PairingExpired(id)),
+                    ),
+                ]);
+            }
+
+            Message::PairDeviceFinished(device_id, result, devices) => {
+                if let Err(e) = result {
+                    eprintln!("[settings] Failed to pair device {}: {}", device_id, e);
+                    self.pairing_in_progress.remove(&device_id);
+                }
+                if let Some(did) = self.apply_devices_loaded(devices) {
+                    return Self::load_plugin_states_task(did);
+                }
+            }
+
+            Message::PairingExpired(device_id) => {
+                if self.pairing_in_progress.remove(&device_id).is_some() {
+                    return Task::perform(async { backend::fetch_devices().await }, |devices| {
+                        Action::App(Message::DevicesLoaded(devices))
+                    });
+                }
             }
 
             Message::UnpairDevice(device_id) => {
@@ -387,7 +452,9 @@ impl Application for SettingsApp {
                 let id = device_id;
                 return Task::perform(
                     async move {
-                        backend::unpair_device(id).await.ok();
+                        if let Err(e) = backend::unpair_device(id).await {
+                            eprintln!("[settings] Failed to unpair device: {:?}", e);
+                        }
                         backend::fetch_devices().await
                     },
                     |devices| Action::App(Message::DevicesLoaded(devices)),
@@ -398,25 +465,30 @@ impl Application for SettingsApp {
             // so paired/connected state changes appear without waiting for polling.
             Message::ServiceEvent(event) => {
                 match &event {
-                    kdeconnect_dbus_client::ServiceEvent::DeviceDisconnected(id) => {
-                        if self.selected_device.as_deref() == Some(id.as_str()) {
-                            // Keep selection — device is just offline, not unpaired.
-                        }
+                    kdeconnect_dbus_client::ServiceEvent::DeviceDisconnected(id)
+                        if self.selected_device.as_deref() == Some(id.as_str()) =>
+                    {
+                        // Keep selection — device is just offline, not unpaired.
+                        self.pairing_in_progress.remove(id);
                     }
-                    kdeconnect_dbus_client::ServiceEvent::DevicePaired(id, device) => {
+                    kdeconnect_dbus_client::ServiceEvent::DeviceDisconnected(id) => {
+                        self.pairing_in_progress.remove(id);
+                    }
+                    kdeconnect_dbus_client::ServiceEvent::DevicePaired(id, device)
                         if !device.is_paired
-                            && self.selected_device.as_deref() == Some(id.as_str())
-                        {
-                            self.selected_device = None;
-                            self.plugin_states.remove(id);
-                        }
+                            && self.selected_device.as_deref() == Some(id.as_str()) =>
+                    {
+                        self.selected_device = None;
+                        self.plugin_states.remove(id);
+                    }
+                    kdeconnect_dbus_client::ServiceEvent::PairingFinished(id) => {
+                        self.pairing_in_progress.remove(id);
                     }
                     _ => {}
                 }
-                return Task::perform(
-                    async { backend::fetch_devices().await },
-                    |devices| Action::App(Message::DevicesLoaded(devices)),
-                );
+                return Task::perform(async { backend::fetch_devices().await }, |devices| {
+                    Action::App(Message::DevicesLoaded(devices))
+                });
             }
             Message::RunCommandsLoaded(cmds) => {
                 self.run_commands = cmds;
@@ -476,10 +548,7 @@ impl Application for SettingsApp {
 // ---------------------------------------------------------------------------
 
 impl SettingsApp {
-    fn view_tab_bar<'a>(
-        &'a self,
-        spacing: &cosmic::cosmic_theme::Spacing,
-    ) -> Element<'a, Message> {
+    fn view_tab_bar<'a>(&'a self, spacing: &cosmic::cosmic_theme::Spacing) -> Element<'a, Message> {
         let paired_btn = if self.active_tab == Tab::PairedDevices {
             widget::button::standard(fl!("settings-tab-paired"))
                 .on_press(Message::SelectTab(Tab::PairedDevices))
@@ -526,11 +595,8 @@ impl SettingsApp {
 
         if paired.is_empty() {
             col = col.push(
-                widget::container(
-                    widget::text(fl!("paired-devices-none"))
-                        .size(12),
-                )
-                .padding(spacing.space_s),
+                widget::container(widget::text(fl!("paired-devices-none")).size(12))
+                    .padding(spacing.space_s),
             );
         } else {
             for device in paired {
@@ -644,10 +710,8 @@ impl SettingsApp {
 
         if self.selected_device.is_none() {
             col = col.push(
-                widget::container(
-                    widget::text(fl!("paired-plugins-hint")).size(14),
-                )
-                .padding(spacing.space_l),
+                widget::container(widget::text(fl!("paired-plugins-hint")).size(14))
+                    .padding(spacing.space_l),
             );
             return widget::scrollable(col).height(Length::Fill).into();
         }
@@ -722,12 +786,12 @@ impl SettingsApp {
                         .font(cosmic::font::bold())
                         .width(Length::Fill),
                 )
-                .push(widget::button::standard(fl!("settings-scan-again")).on_press(Message::Refresh)),
+                .push(
+                    widget::button::standard(fl!("settings-scan-again")).on_press(Message::Refresh),
+                ),
         );
         col = col.push(widget::divider::horizontal::default());
-        col = col.push(
-            widget::text(fl!("available-devices-hint")).size(13),
-        );
+        col = col.push(widget::text(fl!("available-devices-hint")).size(13));
 
         if available.is_empty() {
             col = col.push(
@@ -740,11 +804,11 @@ impl SettingsApp {
                                 .size(16)
                                 .font(cosmic::font::bold()),
                         )
+                        .push(widget::text(fl!("available-devices-none-hint")).size(13))
                         .push(
-                            widget::text(fl!("available-devices-none-hint"))
-                            .size(13),
+                            widget::button::standard(fl!("settings-scan-again"))
+                                .on_press(Message::Refresh),
                         )
-                        .push(widget::button::standard(fl!("settings-scan-again")).on_press(Message::Refresh))
                         .align_x(Alignment::Center),
                 )
                 .padding([spacing.space_xl, spacing.space_m])
@@ -754,7 +818,7 @@ impl SettingsApp {
         } else {
             for device in available {
                 let device_id = device.id.clone();
-                let in_progress = *self.pairing_in_progress.get(&device.id).unwrap_or(&false);
+                let in_progress = self.pairing_in_progress.contains_key(&device.id);
 
                 let card = widget::Row::new()
                     .spacing(spacing.space_m)
@@ -842,9 +906,12 @@ impl SettingsApp {
                 .width(Length::Fill),
         );
         col = col.push(
-            widget::text_input(fl!("run-commands-command-placeholder"), &self.new_cmd_command)
-                .on_input(Message::NewRunCommandCommand)
-                .width(Length::Fill),
+            widget::text_input(
+                fl!("run-commands-command-placeholder"),
+                &self.new_cmd_command,
+            )
+            .on_input(Message::NewRunCommandCommand)
+            .width(Length::Fill),
         );
         col = col.push(
             widget::button::suggested(fl!("run-commands-add-button"))
@@ -877,7 +944,6 @@ fn uuid_v4() -> String {
 }
 
 fn main() -> cosmic::iced::Result {
-    let settings = cosmic::app::Settings::default()
-        .size(cosmic::iced::Size::new(740.0, 540.0));
+    let settings = cosmic::app::Settings::default().size(cosmic::iced::Size::new(740.0, 540.0));
     cosmic::app::run::<SettingsApp>(settings, ())
 }

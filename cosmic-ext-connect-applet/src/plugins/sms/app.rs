@@ -1,11 +1,11 @@
 use async_stream::stream;
+use cosmic::iced::widget::scrollable;
 use cosmic::{
     Action, Application, ApplicationExt, Element, Task,
     app::Core,
     iced::{Length, Subscription},
     widget,
 };
-use cosmic::iced::widget::scrollable;
 use futures::StreamExt;
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
@@ -239,16 +239,24 @@ impl Application for SmsWindow {
 
                 // Update the conversation preview and timestamp so it sorts to
                 // the top of the list immediately without waiting for a server refresh.
-                if let Some(conv) = self.conversations.iter_mut().find(|c| c.thread_id == thread_id) {
+                if let Some(conv) = self
+                    .conversations
+                    .iter_mut()
+                    .find(|c| c.thread_id == thread_id)
+                {
                     conv.last_message = text.clone();
                     conv.timestamp = now;
                 }
-                self.conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                self.conversations
+                    .sort_by_key(|b| std::cmp::Reverse(b.timestamp));
 
                 // Scroll the conversation list to the top so the moved item is visible.
                 let scroll_task = scrollable::scroll_to(
                     views::CONVERSATIONS_SCROLLABLE_ID.clone(),
-                    scrollable::AbsoluteOffset { x: Some(0.0), y: Some(0.0) },
+                    scrollable::AbsoluteOffset {
+                        x: Some(0.0),
+                        y: Some(0.0),
+                    },
                 );
 
                 return Task::batch(vec![
@@ -261,7 +269,10 @@ impl Application for SmsWindow {
             }
             SmsMessage::RefreshThread => {}
             SmsMessage::ProtocolEventReceived(event) => {
-                debug!("ProtocolEventReceived: {:?}", std::mem::discriminant(&event));
+                debug!(
+                    "ProtocolEventReceived: {:?}",
+                    std::mem::discriminant(&event)
+                );
                 self.handle_protocol_event(event);
             }
             SmsMessage::OpenNewChatDialog => {
@@ -319,7 +330,10 @@ impl SmsWindow {
     fn handle_protocol_event(&mut self, event: ProtocolEvent) {
         match event {
             ProtocolEvent::ConversationsReceived(conversations) => {
-                debug!("ConversationsReceived: {} conversations", conversations.len());
+                debug!(
+                    "ConversationsReceived: {} conversations",
+                    conversations.len()
+                );
 
                 // Capture selected new_* phone BEFORE we mutate merged
                 let pending_new_phone: Option<String> = self
@@ -366,13 +380,13 @@ impl SmsWindow {
                 self.update_conversation_names();
 
                 // If we had a new_* selected, find its real thread by phone number now
-                if let Some(phone) = pending_new_phone {
-                    if let Some(real) = self.conversations.iter().find(|c| {
+                if let Some(phone) = pending_new_phone
+                    && let Some(real) = self.conversations.iter().find(|c| {
                         !c.thread_id.starts_with("new_")
                             && super::utils::phone_numbers_match(&c.phone_number, &phone)
-                    }) {
-                        self.selected_thread = Some(real.thread_id.clone());
-                    }
+                    })
+                {
+                    self.selected_thread = Some(real.thread_id.clone());
                 }
             }
             ProtocolEvent::MessageReceived(message) => {
@@ -412,7 +426,7 @@ impl SmsWindow {
                     conv.timestamp = message.date;
                 }
                 self.conversations
-                    .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                    .sort_by_key(|b| std::cmp::Reverse(b.timestamp));
             }
             ProtocolEvent::Error(e) => error!("SMS protocol error: {}", e),
         }
